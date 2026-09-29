@@ -1,12 +1,13 @@
 /* ═══════════════════════════════════════════════════════════
    SHADOW OF SALEM — app.js
    ES module. All Firebase calls go through firebase.js.
-   Local media (audio/video/images) stays in memory only —
-   blob: URLs are never written to Firestore.
+   R2 media storage is handled entirely via storage.js.
+   blob: URLs are used for local preview only — never stored.
 ═══════════════════════════════════════════════════════════ */
 
 console.log('[Firebase] app.js module executing');
 import { auth, db } from './firebase.js';
+import { uploadMedia, deleteMedia, getMediaUrl, validateMediaFile } from './storage.js';
 
 import {
   createUserWithEmailAndPassword,
@@ -175,6 +176,9 @@ const SEED_COLLECTIONS = [
 // ─── In-memory local media registry ──────────────────────────
 // blob: URLs are never stored in Firestore. They live here keyed
 // by creation ID for the current session only.
+// LocalMedia: in-memory store for local-preview blob URLs only.
+// These are NEVER written to Firestore and disappear on refresh.
+// After a successful R2 upload, the permanent R2 URL is used instead.
 const LocalMedia = {
   _store: {},
   set(id, urls) { this._store[id] = urls; },
@@ -870,12 +874,13 @@ async function fsAddCreation(creationData) {
   const uid  = State.currentUser.uid;
   const name = State.myProfile?.displayName || State.currentUser.displayName || 'Creator';
 
-  // Never store blob: URLs — only metadata
+  // Never store blob: URLs — only metadata and R2 permanent URLs
   const safeData = clean({
     type:        creationData.type,
     title:       creationData.title,
     creator:     name,
     creatorId:   uid,
+    creatorUsername: State.myProfile?.username || null,
     description: creationData.description || '',
     category:    creationData.category || '',
     tags:        creationData.tags || [],
@@ -884,12 +889,18 @@ async function fsAddCreation(creationData) {
     duration:    creationData.duration || null,
     likes: 0, comments: 0, plays: 0,
     hasLocalMedia: creationData.hasLocalMedia || false,
+    // R2 media fields (set after upload; null for text-only creations)
+    mediaUrl:  creationData.mediaUrl  || null,
+    mediaKey:  creationData.mediaKey  || null,
+    mimeType:  creationData.mimeType  || null,
+    fileSize:  creationData.fileSize  || null,
     createdAt: serverTimestamp(),
   });
 
   const docRef = await addDoc(collection(db, 'creations'), safeData);
 
-  // Store local media blob URL in memory only (not Firestore)
+  // Store local-preview blob URL in memory only (not Firestore)
+  // This is only used for the uploader's own session before refresh.
   if (creationData.audioURL || creationData.videoURL || creationData.coverURL) {
     LocalMedia.set(docRef.id, {
       audioURL: creationData.audioURL || null,
@@ -935,6 +946,17 @@ async function fsDeleteCreation(creationId) {
   if (!c || c.creatorId !== State.currentUser.uid) {
     Toast.error('You can only delete your own creations.'); return;
   }
+
+  // Delete R2 media first (Worker verifies ownership again server-side)
+  if (c.mediaKey) {
+    try {
+      await deleteMedia(c.mediaKey, auth);
+    } catch (e) {
+      // Log but don't block the Firestore delete — the object may already be gone
+      console.warn('[R2] Could not delete media object:', e.message);
+    }
+  }
+
   await deleteDoc(doc(db, 'creations', creationId));
   LocalMedia.clear(creationId);
 }
@@ -1050,9 +1072,14 @@ const OmegaPlayer = (() => {
     if (!currentTrack) return;
     const art         = document.getElementById('player-art');
     const placeholder = document.getElementById('player-art-placeholder');
+    // Prefer R2 permanent URL (available to all devices/sessions),
+    // fall back to in-memory local preview blob URL for the uploader's session.
+    const r2CoverUrl  = currentTrack.mediaUrl && currentTrack.type === 'art'
+      ? currentTrack.mediaUrl : null;
     const media       = LocalMedia.get(currentTrack.id);
-    if (media.coverURL) {
-      art.src = media.coverURL;
+    const coverSrc    = r2CoverUrl || media.coverURL || null;
+    if (coverSrc) {
+      art.src = coverSrc;
       art.style.display = 'block';
       placeholder.style.display = 'none';
     } else if (currentTrack.coverColor) {
@@ -1100,11 +1127,14 @@ const OmegaPlayer = (() => {
     currentTrack = track;
     queue        = newQueue;
     queueIndex   = idx;
-    const media  = LocalMedia.get(track.id);
-    audio.src    = media.audioURL || '';
+    // Prefer R2 permanent URL — works cross-device and after refresh.
+    // Fall back to the local blob URL for the uploader's own session.
+    const media    = LocalMedia.get(track.id);
+    const audioSrc = track.mediaUrl || media.audioURL || '';
+    audio.src      = audioSrc;
     playerEl.classList.remove('hidden');
     updateUI();
-    if (media.audioURL) audio.play().catch(() => {});
+    if (audioSrc) audio.play().catch(() => {});
   }
 
   return {
@@ -1328,12 +1358,17 @@ function buildCreationCard(c, opts = {}) {
     : `style="background:var(--omega-surface)"`;
   const cardClass = opts.square ? 'card-media card-media--square' : 'card-media';
 
+  // Use R2 permanent URL for art cover thumbnails
+  const r2CoverUrl = (c.type === 'art' || c.type === 'image') && c.mediaUrl ? c.mediaUrl : null;
+
   return `
     <div class="creation-card" onclick="navigate('viewer',{id:'${esc(c.id)}',type:'${esc(c.type)}'})">
       <div class="${cardClass}" ${mediaBg}>
-        <div class="card-media-placeholder">
-          <div style="width:48px;height:48px;color:var(--electric);opacity:0.5">${typeIcon(c.type)}</div>
-        </div>
+        ${r2CoverUrl
+          ? `<img src="${esc(r2CoverUrl)}" alt="${esc(c.title)}" style="width:100%;height:100%;object-fit:cover;border-radius:inherit;display:block" loading="lazy">`
+          : `<div class="card-media-placeholder">
+               <div style="width:48px;height:48px;color:var(--electric);opacity:0.5">${typeIcon(c.type)}</div>
+             </div>`}
         <div class="card-play-overlay">
           ${isAudio ? `
             <button class="card-play-btn ${isPlaying ? 'card-playing-btn' : ''}"
@@ -1423,6 +1458,8 @@ window.playCreation = function(id) {
   const queueTracks    = audioCreations.map(x => ({
     id: x.id, title: x.title, creator: x.creator,
     coverColor: x.coverColor,
+    // Include R2 URL so the player can stream it cross-device after upload
+    mediaUrl: x.mediaUrl || null,
   }));
   const idx = queueTracks.findIndex(t => t.id === id);
   OmegaPlayer.load(queueTracks[idx >= 0 ? idx : 0], queueTracks, idx >= 0 ? idx : 0);
@@ -1750,6 +1787,11 @@ const Pages = {
     const isText   = c.type === 'text';
     const isOwner  = !!(State.currentUser && c.creatorId === State.currentUser.uid);
     const media    = LocalMedia.get(c.id);
+    // Prefer R2 permanent URLs — available cross-device, survives refresh.
+    // Fall back to in-memory blob URLs for the uploader's current session.
+    const viewerAudioSrc = c.mediaUrl || media.audioURL || null;
+    const viewerVideoSrc = c.mediaUrl || media.videoURL || null;
+    const viewerImgSrc   = c.mediaUrl || media.coverURL || null;
 
     container.innerHTML = `
       <div class="viewer-page">
@@ -1764,7 +1806,7 @@ const Pages = {
               <div class="waveform-bars" id="viewer-waveform">
                 ${Array.from({length:20},(_,i)=>`<div class="wave-bar ${OmegaPlayer.isCurrentTrack(c.id)&&OmegaPlayer.isPlaying()?'playing':''}" style="height:${4+Math.sin(i*0.9)*12+6}px;animation-delay:${(i%5)*0.1}s"></div>`).join('')}
               </div>
-              ${!media.audioURL ? `<div style="padding:6px 0;text-align:center;font-size:0.78rem;color:var(--text-muted)">Audio is local to the uploader's device and not available here.</div>` : ''}
+              ${!viewerAudioSrc ? `<div style="padding:6px 0;text-align:center;font-size:0.78rem;color:var(--text-muted)">Audio not yet available — the creator may still be uploading.</div>` : ''}
               <div class="viewer-controls">
                 <button class="viewer-skip-btn" onclick="OmegaPlayer.prev()" aria-label="Previous">
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="19 20 9 12 19 4 19 20"/><line x1="5" y1="19" x2="5" y2="5"/></svg>
@@ -1793,19 +1835,19 @@ const Pages = {
             </div>
           ` : isVideo ? `
             <div>
-              ${media.videoURL
-                ? `<video controls src="${esc(media.videoURL)}" style="width:100%;max-height:70vh;background:#000;display:block"></video>`
+              ${viewerVideoSrc
+                ? `<video controls src="${esc(viewerVideoSrc)}" style="width:100%;max-height:70vh;background:#000;display:block"></video>`
                 : `<div style="min-height:260px;display:flex;align-items:center;justify-content:center;flex-direction:column;background:var(--omega-surface);gap:12px;padding:40px;text-align:center">
                      ${typeIcon('video')}
-                     <p style="color:var(--text-muted);font-size:0.85rem">Video is local to the uploader's device and not available here.</p>
+                     <p style="color:var(--text-muted);font-size:0.85rem">Video not yet available — the creator may still be uploading.</p>
                    </div>`}
             </div>
           ` : isText ? `
             <div style="display:none"></div>
           ` : `
             <div style="min-height:300px;display:flex;align-items:center;justify-content:center;padding:24px;background:${esc(c.coverColor||'var(--omega-surface)')}">
-              ${media.coverURL
-                ? `<img src="${esc(media.coverURL)}" style="max-height:340px;max-width:100%;border-radius:var(--r-md)">`
+              ${viewerImgSrc
+                ? `<img src="${esc(viewerImgSrc)}" style="max-height:340px;max-width:100%;border-radius:var(--r-md)">`
                 : `<div style="color:var(--electric);opacity:0.5;width:80px;height:80px">${typeIcon(c.type)}</div>`}
             </div>
           `}
@@ -1904,12 +1946,18 @@ function renderProfileHTML(container, profile, creations, isOwn) {
     container.innerHTML = `<div class="empty-state"><h3>Creator not found</h3><button class="btn btn-ghost mt-md" onclick="navigate('stream')">← Stream</button></div>`;
     return;
   }
+  // Profile & cover images: use R2 URLs if available, else generated avatar
+  const profilePicSrc = profile.profilePicUrl || avatarUrl(profile.displayName || profile.username);
+  const coverStyle    = profile.coverUrl
+    ? `background-image:url('${esc(profile.coverUrl)}');background-size:cover;background-position:center`
+    : '';
+
   container.innerHTML = `
     <div class="profile-header">
-      <div class="profile-cover"><div class="profile-cover-placeholder"></div></div>
+      <div class="profile-cover" ${coverStyle ? `style="${coverStyle}"` : ''}>${coverStyle ? '' : '<div class="profile-cover-placeholder"></div>'}</div>
       <div style="display:flex;align-items:flex-end;gap:16px;padding:0 var(--space-lg);margin-top:-20px;flex-wrap:wrap">
         <div class="profile-avatar-wrap">
-          <img src="${avatarUrl(profile.displayName || profile.username)}" class="avatar avatar-xl profile-avatar" alt="${esc(profile.displayName || profile.username)}">
+          <img src="${esc(profilePicSrc)}" class="avatar avatar-xl profile-avatar" alt="${esc(profile.displayName || profile.username)}">
         </div>
         ${isOwn ? `<div style="display:flex;gap:8px;margin-bottom:4px">
           <button class="btn btn-ghost btn-sm" onclick="openEditProfileModal()">Edit Profile</button>
@@ -2099,7 +2147,7 @@ window.showUploadForm = function(type) {
            ondrop="handleFileDrop(event,'${type}')">
         <div class="drop-zone-icon">${typeIcon(type)}</div>
         <div class="drop-zone-text">Click to select a ${fileLabels[type]} or drag & drop</div>
-        <div class="drop-zone-hint">File stays on your device — media is not uploaded to a server</div>
+        <div class="drop-zone-hint">Select your file — it will be uploaded securely to R2</div>
       </div>
       <input type="file" id="upload-file-input" accept="${accepts[type]}" style="display:none"
              onchange="handleFileSelected(this.files[0],'${type}')">
@@ -2175,19 +2223,39 @@ function renderFilePreview(file, type) {
   const area = document.getElementById('upload-preview-area');
   if (!area) return;
   const url = URL.createObjectURL(file);
-  // Store blob URL in a data attribute — never goes to Firestore
+  // Store blob URL in a data attribute for local preview (never goes to Firestore)
   area.dataset.localUrl  = url;
   area.dataset.mediaType = type;
+  // Store the raw File object so submitCreation can access it for R2 upload
+  area._selectedFile = file;
+
+  const sizeMB = (file.size / 1024 / 1024).toFixed(1);
 
   if (type === 'art') {
-    area.innerHTML = `<div class="mt-md"><img src="${url}" style="max-height:200px;border-radius:var(--r-md);border:1px solid var(--omega-border)"><p style="font-size:0.78rem;color:var(--text-muted);margin-top:6px">${esc(file.name)}</p></div>`;
+    area.innerHTML = `<div class="mt-md">
+      <img src="${url}" style="max-height:200px;border-radius:var(--r-md);border:1px solid var(--omega-border)">
+      <p style="font-size:0.78rem;color:var(--text-muted);margin-top:6px">${esc(file.name)} — ${sizeMB} MB</p>
+    </div>`;
   } else if (type === 'music' || type === 'audio') {
     area.innerHTML = `<div class="mt-md" style="background:var(--omega-surface);border-radius:var(--r-md);padding:14px;border:1px solid var(--omega-border)">
       <audio controls src="${url}" style="width:100%;margin-bottom:6px"></audio>
-      <p style="font-size:0.78rem;color:var(--text-muted)">${esc(file.name)}</p>
+      <p style="font-size:0.78rem;color:var(--text-muted)">${esc(file.name)} — ${sizeMB} MB</p>
     </div>`;
   } else if (type === 'video') {
-    area.innerHTML = `<div class="mt-md"><video controls src="${url}" style="width:100%;max-height:220px;border-radius:var(--r-md);border:1px solid var(--omega-border)"></video><p style="font-size:0.78rem;color:var(--text-muted);margin-top:6px">${esc(file.name)}</p></div>`;
+    area.innerHTML = `<div class="mt-md"><video controls src="${url}" style="width:100%;max-height:220px;border-radius:var(--r-md);border:1px solid var(--omega-border)"></video><p style="font-size:0.78rem;color:var(--text-muted);margin-top:6px">${esc(file.name)} — ${sizeMB} MB</p></div>`;
+  }
+
+  // Insert progress bar below preview (hidden until upload starts)
+  if (!document.getElementById('upload-progress-wrap')) {
+    const prog = document.createElement('div');
+    prog.id = 'upload-progress-wrap';
+    prog.style.cssText = 'margin-top:12px;display:none';
+    prog.innerHTML = `
+      <div style="font-size:0.78rem;color:var(--text-muted);margin-bottom:4px" id="upload-progress-msg"></div>
+      <div style="background:var(--omega-border);border-radius:4px;overflow:hidden;height:6px">
+        <div id="upload-progress-bar" style="height:100%;background:var(--electric);width:0%;transition:width 0.2s ease"></div>
+      </div>`;
+    area.parentElement?.insertBefore(prog, area.nextSibling);
   }
 }
 
@@ -2208,32 +2276,90 @@ window.submitCreation = async function(type) {
   const area      = document.getElementById('upload-preview-area');
   const localUrl  = area?.dataset?.localUrl  || null;
   const mediaType = area?.dataset?.mediaType || null;
+  // The raw File object — stored by renderFilePreview
+  const selectedFile = area?._selectedFile || null;
 
   const tags = (document.getElementById('upload-tags')?.value || '')
     .split(',').map(t => t.trim().toLowerCase()).filter(Boolean).slice(0, 5);
 
-  const creationData = {
-    type:        isTextOnly ? 'text' : type,
-    title:       title || description.slice(0, 60) || 'Untitled', // auto-title for text posts
-    description,
-    category:    document.getElementById('upload-category')?.value || '',
-    tags,
-    coverColor:  'linear-gradient(135deg,#0a000f,#1a002a,#050010)',
-    hasLocalMedia: !!localUrl,
-    // Blob URLs stay local — passed to LocalMedia, not Firestore
-    audioURL: (mediaType === 'music' || mediaType === 'audio') ? localUrl : null,
-    videoURL: mediaType === 'video' ? localUrl : null,
-    coverURL: mediaType === 'art'   ? localUrl : null,
+  // Validate the file before we touch Firestore
+  if (!isTextOnly && selectedFile) {
+    const validErr = validateMediaFile(selectedFile, mediaType || type);
+    if (validErr) { Toast.error(validErr); return; }
+  }
+
+  // ── Disable publish button while uploading ──────────────────
+  const publishBtn = document.querySelector('[onclick^="submitCreation"]');
+  if (publishBtn) publishBtn.disabled = true;
+
+  // ── Progress indicator ──────────────────────────────────────
+  const progressBar = document.getElementById('upload-progress-bar');
+  const progressMsg = document.getElementById('upload-progress-msg');
+  const setProgress = (msg, pct) => {
+    if (progressMsg) progressMsg.textContent = msg;
+    if (progressBar) {
+      progressBar.style.width = pct + '%';
+      progressBar.parentElement.style.display = pct > 0 ? '' : 'none';
+    }
   };
 
   try {
+    let r2Result = null; // { mediaKey, mediaUrl, mimeType, fileSize }
+
+    // ── Upload to R2 if there is a file ─────────────────────────
+    if (!isTextOnly && selectedFile) {
+      setProgress('Preparing…', 5);
+      try {
+        r2Result = await uploadMedia({
+          file:      selectedFile,
+          mediaKind: mediaType || type,
+          auth,
+          onProgress: ({ stage, percent }) => setProgress(stage, percent),
+        });
+      } catch (uploadErr) {
+        console.error('[R2] Upload failed:', uploadErr);
+        Toast.error('Upload failed — ' + uploadErr.message + '. Try Again');
+        setProgress('Upload failed', 0);
+        if (publishBtn) publishBtn.disabled = false;
+        return; // Do NOT publish a broken creation
+      }
+    }
+
+    setProgress('Processing…', 98);
+
+    // ── Build creation data ──────────────────────────────────────
+    const creationData = {
+      type:        isTextOnly ? 'text' : type,
+      title:       title || description.slice(0, 60) || 'Untitled',
+      description,
+      category:    document.getElementById('upload-category')?.value || '',
+      tags,
+      coverColor:  'linear-gradient(135deg,#0a000f,#1a002a,#050010)',
+      hasLocalMedia: !!localUrl && !r2Result, // only true when no R2 upload happened
+      // R2 permanent fields — stored in Firestore for cross-device delivery
+      mediaUrl:  r2Result?.mediaUrl  || null,
+      mediaKey:  r2Result?.mediaKey  || null,
+      mimeType:  r2Result?.mimeType  || null,
+      fileSize:  r2Result?.fileSize  || null,
+      // Local blob URLs for the uploader's current session (NOT written to Firestore)
+      audioURL: (!r2Result && (mediaType === 'music' || mediaType === 'audio')) ? localUrl : null,
+      videoURL: (!r2Result && mediaType === 'video') ? localUrl : null,
+      coverURL: (!r2Result && mediaType === 'art')   ? localUrl : null,
+    };
+
+    // ── Write to Firestore ───────────────────────────────────────
     const newId = await fsAddCreation(creationData);
+    setProgress('Published', 100);
     document.getElementById('upload-form-wrap')?.classList.add('hidden');
-    Toast.success(`Published to Shadow of Salem!`);
+    Toast.success('Published to Shadow of Salem!');
     if (newId) setTimeout(() => navigate('viewer', { id: newId }), 400);
+
   } catch (e) {
     Toast.error('Failed to publish. Please try again.');
     console.error(e);
+    setProgress('', 0);
+  } finally {
+    if (publishBtn) publishBtn.disabled = false;
   }
 };
 
@@ -2363,7 +2489,12 @@ function renderCommentsList(comments) {
 // ─── Profile edit modal ───────────────────────────────────────
 
 window.openEditProfileModal = function() {
-  const p = State.myProfile || {};
+  const p         = State.myProfile || {};
+  const avatarSrc = p.profilePicUrl || avatarUrl(p.displayName || p.username || '');
+  const coverBg   = p.coverUrl
+    ? `url('${esc(p.coverUrl)}') center/cover`
+    : 'var(--omega-surface)';
+
   Modal.open(`
     <div class="modal-header">
       <div class="modal-title">Edit Profile</div>
@@ -2382,12 +2513,57 @@ window.openEditProfileModal = function() {
         <label class="form-label">Bio</label>
         <textarea class="form-input" id="ep-bio" maxlength="200" placeholder="Tell the universe who you are…">${esc(p.bio||'')}</textarea>
       </div>
+
+      <div class="form-group">
+        <label class="form-label">Profile Picture</label>
+        <div style="display:flex;align-items:center;gap:12px">
+          <img id="ep-pic-preview" src="${esc(avatarSrc)}" class="avatar avatar-lg" style="width:56px;height:56px;object-fit:cover" alt="Profile picture">
+          <div>
+            <input type="file" id="ep-pic-input" accept="image/jpeg,image/png,image/webp,image/gif" style="display:none"
+                   onchange="previewProfileFile(this.files[0],'pic')">
+            <button type="button" class="btn btn-ghost btn-sm" onclick="document.getElementById('ep-pic-input').click()">Change Photo</button>
+            <div style="font-size:0.72rem;color:var(--text-muted);margin-top:3px">JPG, PNG, WEBP — max 20 MB</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="form-group">
+        <label class="form-label">Cover Image</label>
+        <div id="ep-cover-preview" style="width:100%;height:80px;border-radius:var(--r-md);border:1px solid var(--omega-border);background:${coverBg};margin-bottom:6px"></div>
+        <input type="file" id="ep-cover-input" accept="image/jpeg,image/png,image/webp" style="display:none"
+               onchange="previewProfileFile(this.files[0],'cover')">
+        <button type="button" class="btn btn-ghost btn-sm" onclick="document.getElementById('ep-cover-input').click()">Change Cover</button>
+        <span style="font-size:0.72rem;color:var(--text-muted);margin-left:8px">JPG, PNG, WEBP — max 20 MB</span>
+      </div>
+
+      <div id="ep-upload-progress-wrap" style="display:none;margin-top:8px">
+        <div style="font-size:0.78rem;color:var(--text-muted);margin-bottom:4px" id="ep-progress-msg"></div>
+        <div style="background:var(--omega-border);border-radius:4px;overflow:hidden;height:6px">
+          <div id="ep-progress-bar" style="height:100%;background:var(--electric);width:0%;transition:width 0.2s ease"></div>
+        </div>
+      </div>
     </div>
     <div class="modal-footer">
       <button type="button" class="btn btn-ghost" onclick="Modal.close()">Cancel</button>
-      <button type="button" class="btn btn-primary" onclick="saveProfile()">Save</button>
+      <button type="button" class="btn btn-primary" id="ep-save-btn" onclick="saveProfile()">Save</button>
     </div>
   `);
+};
+
+// Preview a new profile picture or cover before upload
+window.previewProfileFile = function(file, kind) {
+  if (!file) return;
+  const url = URL.createObjectURL(file);
+  if (kind === 'pic') {
+    const img = document.getElementById('ep-pic-preview');
+    if (img) { img.src = url; img._newFile = file; }
+  } else if (kind === 'cover') {
+    const div = document.getElementById('ep-cover-preview');
+    if (div) {
+      div.style.background = `url('${url}') center/cover`;
+      div._newFile = file;
+    }
+  }
 };
 
 window.saveProfile = async function() {
@@ -2402,30 +2578,112 @@ window.saveProfile = async function() {
   const uid = State.currentUser?.uid;
   if (!uid) return;
 
-  const updates = clean({
-    uid,
-    displayName:   name,
-    username:      username || undefined,
-    usernameLower: username ? username.toLowerCase() : undefined,
-    bio,
-  });
+  // ── Check for new profile pic / cover uploads ────────────────
+  const picImg   = document.getElementById('ep-pic-preview');
+  const coverDiv = document.getElementById('ep-cover-preview');
+  const newPicFile   = picImg?._newFile   || null;
+  const newCoverFile = coverDiv?._newFile || null;
 
-  // Use setDoc with merge so this works even if the Firestore doc doesn't exist yet
-  await setDoc(doc(db, 'users', uid), updates, { merge: true });
-  await updateProfile(auth.currentUser, { displayName: name });
+  // Show progress if we need to upload
+  const progressWrap = document.getElementById('ep-upload-progress-wrap');
+  const progressMsg  = document.getElementById('ep-progress-msg');
+  const progressBar  = document.getElementById('ep-progress-bar');
+  const saveBtn      = document.getElementById('ep-save-btn');
 
-  State.myProfile = {
-    ...State.myProfile,
-    uid,
-    displayName: name,
-    username: username || State.myProfile?.username,
-    usernameLower: username ? username.toLowerCase() : State.myProfile?.usernameLower,
-    bio,
+  const setProgress = (msg, pct) => {
+    if (!progressWrap) return;
+    progressWrap.style.display = pct > 0 ? '' : 'none';
+    if (progressMsg) progressMsg.textContent = msg;
+    if (progressBar) { progressBar.style.width = pct + '%'; progressBar.parentElement.style.display = ''; }
   };
-  updateAuthNav();
-  Modal.close();
-  Toast.success('Profile updated!');
-  navigate('profile', { profileId: 'my' });
+
+  if (saveBtn) saveBtn.disabled = true;
+
+  let profilePicUrl = State.myProfile?.profilePicUrl || null;
+  let coverUrl      = State.myProfile?.coverUrl      || null;
+
+  try {
+    // Upload new profile picture
+    if (newPicFile) {
+      const validErr = validateMediaFile(newPicFile, 'profile');
+      if (validErr) { Toast.error(validErr); if (saveBtn) saveBtn.disabled = false; return; }
+      setProgress('Uploading profile picture…', 10);
+      // Delete old pic from R2 if it was a custom upload
+      if (State.myProfile?.profilePicKey) {
+        try { await deleteMedia(State.myProfile.profilePicKey, auth); } catch (_) {}
+      }
+      const r2 = await uploadMedia({
+        file: newPicFile, mediaKind: 'profile', auth,
+        onProgress: ({ stage, percent }) => setProgress(stage, 10 + Math.round(percent * 0.45)),
+      });
+      profilePicUrl = r2.mediaUrl;
+      // Store key for future deletion
+      State._newProfilePicKey = r2.mediaKey;
+    }
+
+    // Upload new cover image
+    if (newCoverFile) {
+      const validErr = validateMediaFile(newCoverFile, 'cover');
+      if (validErr) { Toast.error(validErr); if (saveBtn) saveBtn.disabled = false; return; }
+      setProgress('Uploading cover image…', newPicFile ? 55 : 10);
+      // Delete old cover from R2
+      if (State.myProfile?.coverKey) {
+        try { await deleteMedia(State.myProfile.coverKey, auth); } catch (_) {}
+      }
+      const r2 = await uploadMedia({
+        file: newCoverFile, mediaKind: 'cover', auth,
+        onProgress: ({ stage, percent }) => {
+          const base = newPicFile ? 55 : 10;
+          setProgress(stage, base + Math.round(percent * 0.45));
+        },
+      });
+      coverUrl = r2.mediaUrl;
+      State._newCoverKey = r2.mediaKey;
+    }
+
+    setProgress('Saving…', 98);
+
+    const updates = clean({
+      uid,
+      displayName:    name,
+      username:       username || undefined,
+      usernameLower:  username ? username.toLowerCase() : undefined,
+      bio,
+      profilePicUrl:  profilePicUrl  || undefined,
+      profilePicKey:  State._newProfilePicKey || State.myProfile?.profilePicKey || undefined,
+      coverUrl:       coverUrl       || undefined,
+      coverKey:       State._newCoverKey      || State.myProfile?.coverKey      || undefined,
+    });
+
+    // Use setDoc with merge so this works even if the Firestore doc doesn't exist yet
+    await setDoc(doc(db, 'users', uid), updates, { merge: true });
+    await updateProfile(auth.currentUser, { displayName: name });
+
+    State.myProfile = {
+      ...State.myProfile,
+      ...updates,
+      displayName: name,
+      username: username || State.myProfile?.username,
+      usernameLower: username ? username.toLowerCase() : State.myProfile?.usernameLower,
+      bio,
+      profilePicUrl,
+      coverUrl,
+    };
+    delete State._newProfilePicKey;
+    delete State._newCoverKey;
+
+    updateAuthNav();
+    Modal.close();
+    Toast.success('Profile updated!');
+    navigate('profile', { profileId: 'my' });
+
+  } catch (e) {
+    Toast.error('Could not save profile. Please try again.');
+    console.error(e);
+    setProgress('', 0);
+  } finally {
+    if (saveBtn) saveBtn.disabled = false;
+  }
 };
 
 // ─── Edit / Delete Creation modals ───────────────────────────
