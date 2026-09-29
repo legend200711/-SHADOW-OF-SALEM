@@ -361,7 +361,7 @@ window.openAuthModal = function(tab = 'login') {
   Modal.open(`
     <div class="modal-header">
       <div class="modal-title" id="auth-modal-title">${tab === 'signup' ? 'Create Account' : 'Sign In'}</div>
-      <button class="modal-close" onclick="Modal.close()">
+      <button type="button" class="modal-close" onclick="Modal.close()">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
           <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
         </svg>
@@ -411,8 +411,8 @@ window.openAuthModal = function(tab = 'login') {
       </div>
     </div>
     <div class="modal-footer">
-      <button class="btn btn-ghost" onclick="Modal.close()">Cancel</button>
-      <button id="auth-submit-btn" class="btn btn-create"
+      <button type="button" class="btn btn-ghost" onclick="Modal.close()">Cancel</button>
+      <button type="button" id="auth-submit-btn" class="btn btn-create"
               onclick="${tab==='login'?'submitLogin()':'submitSignup()'}">
         ${tab==='login'?'Sign In':'Create Account'}
       </button>
@@ -484,7 +484,7 @@ window.openResetModal = function() {
   Modal.open(`
     <div class="modal-header">
       <div class="modal-title">Reset Password</div>
-      <button class="modal-close" onclick="Modal.close()">
+      <button type="button" class="modal-close" onclick="Modal.close()">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
           <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
         </svg>
@@ -502,8 +502,8 @@ window.openResetModal = function() {
       <div id="reset-error" style="color:var(--danger);font-size:0.82rem;display:none"></div>
     </div>
     <div class="modal-footer">
-      <button class="btn btn-ghost" onclick="Modal.close()">Cancel</button>
-      <button class="btn btn-create" onclick="submitReset()">Send Reset Link</button>
+      <button type="button" class="btn btn-ghost" onclick="Modal.close()">Cancel</button>
+      <button type="button" class="btn btn-create" onclick="submitReset()">Send Reset Link</button>
     </div>
   `);
 };
@@ -837,19 +837,51 @@ const Toast = {
 // ─── Modal ────────────────────────────────────────────────────
 
 const Modal = {
+  _open: false,
+
   open(html) {
     const overlay   = document.getElementById('modal-overlay');
     const container = document.getElementById('modal-container');
     container.innerHTML = html;
     overlay.classList.remove('hidden');
     container.classList.remove('hidden');
+
+    // Push a history entry so Android/browser Back closes the modal
+    // instead of navigating away from the page.
+    if (!this._open) {
+      history.pushState({ modal: true }, '');
+      this._open = true;
+    }
   },
+
   close() {
     document.getElementById('modal-overlay').classList.add('hidden');
     document.getElementById('modal-container').classList.add('hidden');
     document.getElementById('modal-container').innerHTML = '';
+
+    // If we pushed a history entry for this modal, remove it.
+    if (this._open) {
+      this._open = false;
+      // Only go back if the current state is our modal sentinel —
+      // this avoids double-popping when the browser already fired popstate.
+      if (history.state && history.state.modal) {
+        history.back();
+      }
+    }
   },
 };
+
+// Close modal on browser/Android Back
+window.addEventListener('popstate', (e) => {
+  if (Modal._open) {
+    // The browser already popped the modal history entry.
+    // Just close the UI without calling history.back() again.
+    Modal._open = false;
+    document.getElementById('modal-overlay').classList.add('hidden');
+    document.getElementById('modal-container').classList.add('hidden');
+    document.getElementById('modal-container').innerHTML = '';
+  }
+});
 
 // ─── Mobile nav ───────────────────────────────────────────────
 
@@ -1530,7 +1562,7 @@ window.openCreateCollectionModal = function() {
   Modal.open(`
     <div class="modal-header">
       <div class="modal-title">New Collection</div>
-      <button class="modal-close" onclick="Modal.close()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
+      <button type="button" class="modal-close" onclick="Modal.close()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
     </div>
     <div class="modal-body">
       <div class="form-group">
@@ -1543,8 +1575,8 @@ window.openCreateCollectionModal = function() {
       </div>
     </div>
     <div class="modal-footer">
-      <button class="btn btn-ghost" onclick="Modal.close()">Cancel</button>
-      <button class="btn btn-create" onclick="createCollection()">Create Collection</button>
+      <button type="button" class="btn btn-ghost" onclick="Modal.close()">Cancel</button>
+      <button type="button" class="btn btn-create" onclick="createCollection()">Create Collection</button>
     </div>
   `);
 };
@@ -1819,7 +1851,7 @@ window.openEditProfileModal = function() {
   Modal.open(`
     <div class="modal-header">
       <div class="modal-title">Edit Profile</div>
-      <button class="modal-close" onclick="Modal.close()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
+      <button type="button" class="modal-close" onclick="Modal.close()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
     </div>
     <div class="modal-body">
       <div class="form-group">
@@ -1836,8 +1868,8 @@ window.openEditProfileModal = function() {
       </div>
     </div>
     <div class="modal-footer">
-      <button class="btn btn-ghost" onclick="Modal.close()">Cancel</button>
-      <button class="btn btn-primary" onclick="saveProfile()">Save</button>
+      <button type="button" class="btn btn-ghost" onclick="Modal.close()">Cancel</button>
+      <button type="button" class="btn btn-primary" onclick="saveProfile()">Save</button>
     </div>
   `);
 };
@@ -1864,6 +1896,12 @@ window.saveProfile = async function() {
 // ─── Keyboard shortcuts ───────────────────────────────────────
 
 document.addEventListener('keydown', (e) => {
+  // Escape always closes an open modal, regardless of focus target
+  if (e.code === 'Escape' && Modal._open) {
+    e.preventDefault();
+    Modal.close();
+    return;
+  }
   if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
   if (e.code === 'Space')                    { e.preventDefault(); OmegaPlayer.togglePlay(); }
   if (e.code === 'KeyK')                       OmegaPlayer.togglePlay();
