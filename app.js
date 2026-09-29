@@ -404,47 +404,59 @@ let _authResolved = false; // becomes true after the first onAuthStateChanged ca
 let _loginInProgress = false;
 
 onAuthStateChanged(auth, async user => {
-  State.currentUser = user;
-  updateAuthNav();
+  // ── Wrap entire callback so _authReadyResolve() ALWAYS fires ─────────────
+  // If any awaited call throws (e.g. Firestore permission during profile load),
+  // the catch ensures authReady still resolves and the app never hangs.
+  try {
+    State.currentUser = user;
+    updateAuthNav();
 
-  if (user) {
-    await Promise.all([loadMyProfile(user.uid), loadMyLikes(user.uid)]);
-    updateAuthNav(); // refresh now that myProfile is populated
-    _bootState = 'authenticated';
-  } else {
-    State.myProfile = null;
-    State.myLikes.clear();
+    if (user) {
+      await Promise.all([loadMyProfile(user.uid), loadMyLikes(user.uid)]);
+      updateAuthNav(); // refresh now that myProfile is populated
+      _bootState = 'authenticated';
+    } else {
+      State.myProfile = null;
+      State.myLikes.clear();
+      _bootState = 'guest';
+    }
+  } catch (err) {
+    console.error('Shadow of Salem: onAuthStateChanged error:', err?.code, err?.message, err);
+    // Treat as guest on error — do not leave _bootState stuck on 'booting'
     _bootState = 'guest';
   }
 
+  // Signal authReady regardless of success/failure above
   const wasBooting = !_authResolved;
   if (!_authResolved) {
     _authResolved = true;
-    _authReadyResolve(); // signal that Auth state is known
+    _authReadyResolve();
   }
 
-  // If a user-triggered login just resolved (not the initial boot), navigate
-  // to stream and update the UI immediately — no manual refresh needed.
-  if (!wasBooting && _loginInProgress && user) {
+  // ── Ensure Firestore listeners are always running ─────────────────────────
+  // subscribeCreations/subscribeCollections guard against duplicate listeners
+  // internally, so it is always safe to call them here.
+  // They must run on first boot AND after login/logout so the Stream always
+  // reflects the current state without a page refresh.
+  await maybeSeedFirestore().catch(e => console.warn('maybySeedFirestore skipped:', e?.code));
+  subscribeCreations();
+  subscribeCollections();
+
+  // ── Post-auth navigation (non-boot only) ──────────────────────────────────
+  if (!wasBooting) {
+    if (_loginInProgress && user) {
+      // User-triggered login completed → navigate to Shadow Stream immediately.
+      _loginInProgress = false;
+      navigate('stream');
+      return;
+    }
     _loginInProgress = false;
-    navigate('stream');
-    return;
-  }
-  _loginInProgress = false;
 
-  // If a user-triggered sign-out just resolved, update UI immediately.
-  if (!wasBooting && !user) {
-    navigate('stream');
-    return;
-  }
-
-  // Seed + subscribe regardless of auth state (public reads allowed).
-  // Only run on first boot — subscribeCreations/subscribeCollections guard
-  // against duplicate listeners with their _unsub checks.
-  if (wasBooting) {
-    await maybeSeedFirestore();
-    subscribeCreations();
-    subscribeCollections();
+    if (!user) {
+      // User-triggered sign-out completed → return to guest stream.
+      navigate('stream');
+      return;
+    }
   }
 });
 
@@ -2468,40 +2480,34 @@ document.addEventListener('keydown', (e) => {
 // ─── Init ─────────────────────────────────────────────────────
 
 document.addEventListener('DOMContentLoaded', async () => {
-  // Startup screen is already visible — it was rendered inline in HTML before
-  // any JavaScript ran, so the user never sees a blank/black page.
+  // Startup screen is already visible — rendered inline in HTML before any JS
+  // ran, so the user never sees a blank/black page.
   Startup._init();
 
-  // Safety timeout: if Firebase Auth takes longer than 8 seconds (e.g. offline,
-  // slow network, service outage), dismiss the startup screen and render the
-  // guest shell so the user is never left on a black screen forever.
+  // Safety timeout: if Firebase Auth takes longer than 15 seconds (e.g. slow
+  // CDN cold-start on GitHub Pages, offline, service outage) we stop waiting
+  // and enter guest mode so the user is never left on a blank screen.
+  // This must NOT show an error for a normal slow load — only a genuine timeout.
   const startupTimeout = setTimeout(() => {
-    if (_bootState === 'booting') {
-      console.warn('Shadow of Salem: Firebase Auth timeout — entering guest mode.');
-      _bootState = 'guest';
-      Startup.showError("We're having trouble connecting right now.");
-      // Give the user a moment to read the message, then enter guest mode.
-      setTimeout(() => {
-        const raw = window.location.hash || '#/stream';
-        const { page, params } = hashToRoute(raw);
-        navigate(page, params);
-        Startup.dismiss();
-      }, 1800);
-    }
-  }, 8000);
+    if (_bootState !== 'booting') return; // already resolved — nothing to do
+    console.warn('Shadow of Salem: Firebase Auth timeout — entering guest mode.');
+    _bootState = 'guest';
+    // Ensure Firestore listeners are started even in the fallback path so the
+    // Stream loads public creations as soon as the network is available.
+    maybeSeedFirestore().catch(() => {});
+    subscribeCreations();
+    subscribeCollections();
+    const raw = window.location.hash || '#/stream';
+    const { page, params } = hashToRoute(raw);
+    navigate(page, params);
+    Startup.dismiss();
+  }, 15000);
 
-  try {
-    // Wait for Firebase Auth to resolve before routing.
-    // This prevents the profile page from rendering with currentUser=null
-    // for users who are already signed in (e.g. returning session restore).
-    await authReady;
-    clearTimeout(startupTimeout);
-  } catch (err) {
-    clearTimeout(startupTimeout);
-    console.error('Shadow of Salem: Auth initialisation error:', err);
-    Startup.showError("We're having trouble connecting right now.");
-    await new Promise(r => setTimeout(r, 1800));
-  }
+  // authReady only ever resolves — it never rejects.
+  // The onAuthStateChanged callback has its own try/catch that guarantees
+  // _authReadyResolve() is always called, even on errors.
+  await authReady;
+  clearTimeout(startupTimeout);
 
   // Parse the current URL hash using the canonical router.
   // If no hash is present, default to stream.
