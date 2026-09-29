@@ -5,6 +5,7 @@
    blob: URLs are never written to Firestore.
 ═══════════════════════════════════════════════════════════ */
 
+console.log('[Firebase] app.js module executing');
 import { auth, db } from './firebase.js';
 
 import {
@@ -261,10 +262,20 @@ async function maybeSeedFirestore() {
 
 async function loadMyLikes(uid) {
   State.myLikes.clear();
-  const snap = await getDocs(
-    query(collection(db, 'likes'), where('uid', '==', uid))
-  );
-  snap.forEach(d => State.myLikes.add(d.data().creationId));
+  console.log('[Firebase] Likes query started — uid:', uid);
+  try {
+    const snap = await getDocs(
+      query(collection(db, 'likes'), where('uid', '==', uid))
+    );
+    snap.forEach(d => State.myLikes.add(d.data().creationId));
+    console.log('[Firebase] Likes loaded —', State.myLikes.size, 'likes');
+  } catch (e) {
+    console.error('[Firebase] Likes query FAILED');
+    console.error('[Firebase] code:', e.code);
+    console.error('[Firebase] message:', e.message);
+    console.error(e);
+    throw e; // propagate so onAuthStateChanged catch sees it
+  }
 }
 
 // Set to true while submitSignup owns the Firestore profile write.
@@ -272,10 +283,22 @@ async function loadMyLikes(uid) {
 let _signupInProgress = false;
 
 async function loadMyProfile(uid) {
-  const ref  = doc(db, 'users', uid);
-  const snap = await getDoc(ref);
+  console.log('[Firebase] Profile query started — uid:', uid);
+  let ref, snap;
+  try {
+    ref  = doc(db, 'users', uid);
+    snap = await getDoc(ref);
+    console.log('[Firebase] Profile query returned — exists:', snap.exists());
+  } catch (e) {
+    console.error('[Firebase] Profile read FAILED');
+    console.error('[Firebase] code:', e.code);
+    console.error('[Firebase] message:', e.message);
+    console.error(e);
+    throw e; // propagate so onAuthStateChanged catch sees it
+  }
   if (snap.exists()) {
     State.myProfile = { id: uid, ...snap.data() };
+    console.log('[Firebase] Profile loaded — displayName:', State.myProfile.displayName);
     return;
   }
 
@@ -311,9 +334,11 @@ let _unsubCreations = null;
 let _unsubCollections = null;
 
 function subscribeCreations() {
+  console.log('[Firebase] Creations query started');
   if (_unsubCreations) _unsubCreations();
   const q = query(collection(db, 'creations'), orderBy('createdAt', 'desc'));
   _unsubCreations = onSnapshot(q, snap => {
+    console.log('[Firebase] Creations loaded —', snap.docs.length, 'docs');
     State.creations = snap.docs.map(d => ({
       id: d.id,
       ...d.data(),
@@ -324,20 +349,32 @@ function subscribeCreations() {
     if (['stream','explore','music','video','art','profile'].includes(page)) {
       renderPage(page);
     }
-  }, err => console.error('creations listener:', err));
+  }, err => {
+    console.error('[Firebase] Creations listener FAILED');
+    console.error('[Firebase] code:', err.code);
+    console.error('[Firebase] message:', err.message);
+    console.error(err);
+  });
 }
 
 function subscribeCollections() {
+  console.log('[Firebase] Collections query started');
   if (_unsubCollections) _unsubCollections();
   const q = query(collection(db, 'collections'), orderBy('createdAt', 'desc'));
   _unsubCollections = onSnapshot(q, snap => {
+    console.log('[Firebase] Collections loaded —', snap.docs.length, 'docs');
     State.collections = snap.docs.map(d => ({
       id: d.id,
       ...d.data(),
       createdAt: tsToMs(d.data().createdAt),
     }));
     if (State.currentPage === 'collections') renderPage('collections');
-  }, err => console.error('collections listener:', err));
+  }, err => {
+    console.error('[Firebase] Collections listener FAILED');
+    console.error('[Firebase] code:', err.code);
+    console.error('[Firebase] message:', err.message);
+    console.error(err);
+  });
 }
 
 // ─── App boot state ───────────────────────────────────────────
@@ -404,6 +441,8 @@ let _authResolved = false; // becomes true after the first onAuthStateChanged ca
 let _loginInProgress = false;
 
 onAuthStateChanged(auth, async user => {
+  console.log('[Firebase] onAuthStateChanged fired — user:', user ? ('uid=' + user.uid) : 'null (guest)');
+
   // ── Wrap entire callback so _authReadyResolve() ALWAYS fires ─────────────
   // If any awaited call throws (e.g. Firestore permission during profile load),
   // the catch ensures authReady still resolves and the app never hangs.
@@ -415,13 +454,18 @@ onAuthStateChanged(auth, async user => {
       await Promise.all([loadMyProfile(user.uid), loadMyLikes(user.uid)]);
       updateAuthNav(); // refresh now that myProfile is populated
       _bootState = 'authenticated';
+      console.log('[Firebase] Auth resolved — AUTHENTICATED, uid:', user.uid);
     } else {
       State.myProfile = null;
       State.myLikes.clear();
       _bootState = 'guest';
+      console.log('[Firebase] Auth resolved — GUEST (signed out)');
     }
   } catch (err) {
-    console.error('Shadow of Salem: onAuthStateChanged error:', err?.code, err?.message, err);
+    console.error('[Firebase] onAuthStateChanged inner error:');
+    console.error('[Firebase] code:', err?.code);
+    console.error('[Firebase] message:', err?.message);
+    console.error(err);
     // Treat as guest on error — do not leave _bootState stuck on 'booting'
     _bootState = 'guest';
   }
@@ -431,6 +475,7 @@ onAuthStateChanged(auth, async user => {
   if (!_authResolved) {
     _authResolved = true;
     _authReadyResolve();
+    console.log('[Firebase] authReady resolved — boot complete');
   }
 
   // ── Ensure Firestore listeners are always running ─────────────────────────
@@ -2480,6 +2525,7 @@ document.addEventListener('keydown', (e) => {
 // ─── Init ─────────────────────────────────────────────────────
 
 document.addEventListener('DOMContentLoaded', async () => {
+  console.log('[Firebase] DOMContentLoaded — waiting for authReady');
   // Startup screen is already visible — rendered inline in HTML before any JS
   // ran, so the user never sees a blank/black page.
   Startup._init();
