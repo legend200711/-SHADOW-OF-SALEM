@@ -677,11 +677,62 @@ async function fsIncrementPlays(creationId) {
 
 // ─── Router ───────────────────────────────────────────────────
 
+// Build the canonical hash string for a page + params.
+// This is the single source of truth for URL format.
+function pageToHash(page, params = {}) {
+  switch (page) {
+    case 'viewer':     return params.id          ? `#/viewer/${params.id}`           : '#/stream';
+    case 'profile':    return params.profileId   ? `#/profile/${params.profileId}`   : '#/profile/my';
+    case 'collection': return params.collectionId? `#/collection/${params.collectionId}` : '#/collections';
+    case 'search':     return params.q           ? `#/search/${encodeURIComponent(params.q)}` : '#/search';
+    default:           return `#/${page}`;
+  }
+}
+
+// Parse a raw location.hash into { page, params }.
+function hashToRoute(hash) {
+  const parts = hash.replace(/^#\//, '').split('/');
+  const page  = parts[0] || 'stream';
+  const seg1  = parts[1] ? decodeURIComponent(parts[1]) : null;
+
+  switch (page) {
+    case 'viewer':     return { page: 'viewer',     params: seg1 ? { id: seg1 }           : {} };
+    case 'profile':    return { page: 'profile',    params: seg1 ? { profileId: seg1 }    : { profileId: 'my' } };
+    case 'collection': return { page: 'collection', params: seg1 ? { collectionId: seg1 } : {} };
+    case 'search':     return { page: 'search',     params: seg1 ? { q: seg1 }             : {} };
+    case 'stream': case 'explore': case 'music': case 'video':
+    case 'art': case 'collections': case 'create':
+      return { page, params: {} };
+    default:           return { page: 'stream',     params: {} };
+  }
+}
+
+// Flag that prevents the hashchange listener from triggering a second navigate()
+// when navigate() itself updates the hash.
+let _navigating = false;
+
 function navigate(page, params = {}) {
+  // The nav sidebar Profile button calls navigate('profile') with no params.
+  // That ALWAYS means own profile — never reuse a stale creator ID.
+  if (page === 'profile' && !params.profileId) {
+    params = { profileId: 'my' };
+  }
+
+  // Store only the IDs that are explicitly supplied for this navigation.
+  // Never fall back to a previously stored ID — that is the stale-ID bug.
   State.currentPage = page;
-  if (params.id)           State.currentCreationId   = params.id;
-  if (params.profileId)    State.currentProfileId    = params.profileId;
-  if (params.collectionId) State.currentCollectionId = params.collectionId;
+  State.currentCreationId   = params.id           ?? null;
+  State.currentProfileId    = params.profileId    ?? null;
+  State.currentCollectionId = params.collectionId ?? null;
+
+  // Update the browser URL hash (produces canonical shareable URLs).
+  const newHash = pageToHash(page, params);
+  _navigating = true;
+  window.location.hash = newHash;
+  // _navigating is reset by the hashchange listener (or synchronously if no
+  // hashchange fires because the hash didn't change).
+  // Use setTimeout(0) as a safety reset.
+  setTimeout(() => { _navigating = false; }, 0);
 
   document.querySelectorAll('.nav-link[data-page]').forEach(el => {
     el.classList.toggle('active', el.dataset.page === page);
@@ -698,6 +749,7 @@ function renderPage(page, params = {}) {
   const container = document.getElementById('page-container');
   container.innerHTML = '';
 
+  // Each case receives only the params for THIS render — no stale fallbacks.
   switch (page) {
     case 'stream':      Pages.stream(container); break;
     case 'explore':     Pages.explore(container); break;
@@ -705,11 +757,11 @@ function renderPage(page, params = {}) {
     case 'video':       Pages.gallery(container, 'video'); break;
     case 'art':         Pages.gallery(container, 'art'); break;
     case 'collections': Pages.collections(container); break;
-    case 'collection':  Pages.collectionDetail(container, params.collectionId || State.currentCollectionId); break;
+    case 'collection':  Pages.collectionDetail(container, params.collectionId ?? null); break;
     case 'create':      Pages.create(container); break;
     case 'search':      Pages.search(container, params.q || ''); break;
-    case 'profile':     Pages.profile(container, params.profileId || State.currentProfileId || 'my'); break;
-    case 'viewer':      Pages.viewer(container, params.id || State.currentCreationId); break;
+    case 'profile':     Pages.profile(container, params.profileId ?? 'my'); break;
+    case 'viewer':      Pages.viewer(container, params.id ?? null); break;
     default:            Pages.stream(container);
   }
 }
@@ -895,6 +947,39 @@ const Modal = {
     }
   },
 };
+
+// ─── Hash-based routing (Back / Forward / direct links) ──────
+//
+// hashchange fires when the browser URL changes via Back, Forward,
+// or an external link. navigate() sets _navigating=true before
+// updating location.hash so we skip the re-render that would
+// create an infinite loop.
+window.addEventListener('hashchange', async () => {
+  if (_navigating) {
+    // navigate() triggered this change — skip the redundant re-render.
+    _navigating = false;
+    return;
+  }
+  // Triggered by Back/Forward/external link — route from the new hash.
+  // Auth must be resolved before we attempt to render profile pages.
+  await authReady;
+  const { page, params } = hashToRoute(window.location.hash);
+  // Update nav highlights and render without pushing another hash entry.
+  State.currentPage         = page;
+  State.currentCreationId   = params.id           ?? null;
+  State.currentProfileId    = params.profileId    ?? null;
+  State.currentCollectionId = params.collectionId ?? null;
+
+  document.querySelectorAll('.nav-link[data-page]').forEach(el => {
+    el.classList.toggle('active', el.dataset.page === page);
+  });
+  document.querySelectorAll('.nav-link[data-mobile-page]').forEach(el => {
+    el.classList.toggle('active', el.dataset.mobilePage === page);
+  });
+
+  renderPage(page, params);
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+});
 
 // Close modal on browser/Android Back
 window.addEventListener('popstate', (e) => {
@@ -2002,17 +2087,11 @@ document.addEventListener('DOMContentLoaded', async () => {
   // for users who are already signed in.
   await authReady;
 
-  const hash = window.location.hash.replace('#/', '').split('/');
-  const page = hash[0] || 'stream';
-  const id   = hash[1] || null;
-
-  if (page === 'viewer' && id) {
-    navigate('viewer', { id });
-  } else if (['stream','explore','music','video','art','collections','create','search','profile'].includes(page)) {
-    navigate(page, id ? { profileId: id } : {});
-  } else {
-    navigate('stream');
-  }
+  // Parse the current URL hash using the canonical router.
+  // If no hash is present, default to stream.
+  const raw = window.location.hash || '#/stream';
+  const { page, params } = hashToRoute(raw);
+  navigate(page, params);
 });
 
 // Expose to HTML onclick handlers
