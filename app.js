@@ -1622,11 +1622,21 @@ const Pages = {
 
   // ── PROFILE ──────────────────────────────────────────────────
   profile(container, profileId) {
-    const isOwn = !profileId
-      || profileId === 'my'
-      || (State.currentUser && profileId === State.currentUser.uid);
+    // Resolve "my" → the current auth user's UID
+    const user = State.currentUser || auth.currentUser;
+    const resolvedUid = (profileId === 'my' || !profileId)
+      ? (user?.uid ?? null)
+      : profileId;
 
-    if (isOwn && !State.currentUser) {
+    const isOwn = !!resolvedUid && !!user && resolvedUid === user.uid;
+
+    console.log('[Profile] page opened — profileId:', profileId,
+                '| resolvedUid:', resolvedUid,
+                '| isOwn:', isOwn,
+                '| State.currentUser uid:', State.currentUser?.uid ?? 'null');
+
+    // ── Guest pressing Profile → show sign-in prompt ─────────────
+    if ((profileId === 'my' || !profileId) && !user) {
       container.innerHTML = `
         <div class="empty-state">
           <h3>Sign in to view your profile</h3>
@@ -1636,57 +1646,87 @@ const Pages = {
       return;
     }
 
-    // Show loading state immediately — never show "Creator not found" before lookup completes
+    // Show loading state immediately
     container.innerHTML = `<div style="padding:40px;text-align:center;color:var(--text-muted)">Loading creator…</div>`;
 
     if (isOwn) {
-      // Own profile: State.myProfile is populated by onAuthStateChanged → loadMyProfile.
-      // If it is already available render immediately; otherwise wait briefly.
-      const render = () => {
-        const profile   = State.myProfile;
-        const creations = State.creations.filter(c => c.creatorId === State.currentUser.uid);
+      // ── OWN PROFILE ──────────────────────────────────────────────
+      // Use the same loadMyProfile() repair path that onAuthStateChanged uses.
+      // This ensures a missing users/{uid} document is auto-created,
+      // and never silently falls through to "Creator not found".
+      const uid = user.uid;
+      console.log('[Profile] Own profile — uid:', uid, '| Firestore path: users/' + uid);
+
+      const renderOwn = () => {
+        // Build a guaranteed non-null profile so renderProfileHTML
+        // never shows "Creator not found" for the signed-in user.
+        const profile = State.myProfile || {
+          id:          uid,
+          uid,
+          username:    user.displayName?.toLowerCase().replace(/\s+/g,'_').replace(/[^a-z0-9_]/g,'') || uid.slice(0,8),
+          displayName: user.displayName || user.email?.split('@')[0] || 'Creator',
+          bio:         '',
+        };
+        const creations = State.creations.filter(c => c.creatorId === uid);
+        console.log('[Profile] Rendering own profile — displayName:', profile.displayName,
+                    '| creations:', creations.length);
         renderProfileHTML(container, profile, creations, true);
       };
+
       if (State.myProfile) {
-        render();
+        // Already in memory — render immediately
+        renderOwn();
       } else {
-        // myProfile not yet loaded — fetch directly
-        getDoc(doc(db, 'users', State.currentUser.uid)).then(snap => {
-          if (snap.exists()) {
-            State.myProfile = { id: State.currentUser.uid, ...snap.data() };
-          }
-          render();
+        // Not in memory yet — run through the same repair function used at boot.
+        // loadMyProfile() will create the document if it is missing.
+        loadMyProfile(uid).then(() => {
+          renderOwn();
         }).catch(err => {
-          console.error('profile fetch error:', err);
-          render(); // render with whatever myProfile fallback we have
+          console.error('[Profile] loadMyProfile error — code:', err?.code, err?.message, err);
+          // Even on error, render with auth user data rather than showing "not found"
+          renderOwn();
         });
       }
     } else {
-      // Another user's profile — load from Firestore by UID
-      getDoc(doc(db, 'users', profileId)).then(snap => {
+      // ── ANOTHER USER'S PROFILE ───────────────────────────────────
+      if (!resolvedUid) {
+        container.innerHTML = `<div class="empty-state"><h3>Creator not found</h3><button class="btn btn-ghost mt-md" onclick="navigate('stream')">← Stream</button></div>`;
+        return;
+      }
+
+      console.log('[Profile] Other creator — uid:', resolvedUid,
+                  '| Firestore path: users/' + resolvedUid);
+
+      getDoc(doc(db, 'users', resolvedUid)).then(snap => {
         if (snap.exists()) {
-          const profile   = { id: profileId, ...snap.data() };
-          const creations = State.creations.filter(c => c.creatorId === profileId);
+          const profile   = { id: resolvedUid, ...snap.data() };
+          const creations = State.creations.filter(c => c.creatorId === resolvedUid);
+          console.log('[Profile] Other creator loaded — displayName:', profile.displayName);
           renderProfileHTML(container, profile, creations, false);
         } else {
-          // No Firestore profile doc for this UID — try to show something useful
-          // using cached creation data (e.g. seed creators)
-          const creations = State.creations.filter(c => c.creatorId === profileId);
+          // No Firestore profile doc — try seed/creation data before showing "not found"
+          const creations = State.creations.filter(c => c.creatorId === resolvedUid);
           if (creations.length > 0) {
-            const creator = creations[0].creator || profileId;
+            const creator = creations[0].creator || resolvedUid;
+            console.log('[Profile] Other creator: no doc but has creations — using creator name:', creator);
             renderProfileHTML(
               container,
-              { id: profileId, username: creator, displayName: creator, bio: '' },
+              { id: resolvedUid, username: creator, displayName: creator, bio: '' },
               creations,
               false
             );
           } else {
-            // Genuinely not found after lookup completed
+            // Firestore confirmed: document does not exist, no creations — genuinely not found
+            console.log('[Profile] Other creator: confirmed not found in Firestore — uid:', resolvedUid);
             renderProfileHTML(container, null, [], false);
           }
         }
       }).catch(err => {
-        console.error('Creator profile load error:', err);
+        // Firestore error is NOT the same as "not found"
+        console.error('[Profile] getDoc error — this is NOT Creator not found');
+        console.error('[Profile] code:', err?.code);
+        console.error('[Profile] message:', err?.message);
+        console.error(err);
         const code = err?.code || '';
         let msg = 'Could not load creator profile.';
         if (code === 'permission-denied')  msg = 'You do not have permission to view this profile.';
@@ -1856,6 +1896,11 @@ const Pages = {
 
 function renderProfileHTML(container, profile, creations, isOwn) {
   if (!profile) {
+    if (isOwn) {
+      // Should never happen — Pages.profile() always synthesizes a fallback for own profile.
+      // Log it so we can investigate if it does.
+      console.error('[Profile] renderProfileHTML called with null profile for OWN user — this is a bug');
+    }
     container.innerHTML = `<div class="empty-state"><h3>Creator not found</h3><button class="btn btn-ghost mt-md" onclick="navigate('stream')">← Stream</button></div>`;
     return;
   }
