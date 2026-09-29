@@ -1,0 +1,88 @@
+rules_version = '2';
+
+// ═══════════════════════════════════════════════════════════
+// SHADOW OF SALEM — Firestore Security Rules
+// ═══════════════════════════════════════════════════════════
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ── helpers ──────────────────────────────────────────────
+    function isAuth()        { return request.auth != null; }
+    function isOwner(uid)    { return isAuth() && request.auth.uid == uid; }
+    function notBlob(field)  {
+      // Reject any attempt to store blob: URLs in Firestore
+      return !(field is string && field.matches('^blob:.*'));
+    }
+
+    // ── users ─────────────────────────────────────────────────
+    // Any authenticated user can read any profile.
+    // Only the account owner can write their own profile.
+    match /users/{uid} {
+      allow read:  if true;
+      allow create: if isOwner(uid)
+                    && request.resource.data.keys().hasAll(['username','displayName'])
+                    && notBlob(request.resource.data.get('username',''))
+                    && notBlob(request.resource.data.get('displayName',''));
+      allow update: if isOwner(uid)
+                    && notBlob(request.resource.data.get('username',''))
+                    && notBlob(request.resource.data.get('displayName',''));
+      allow delete: if isOwner(uid);
+    }
+
+    // ── creations ─────────────────────────────────────────────
+    // Everyone can read creations (public feed).
+    // Only authenticated users can create; only the creator can update/delete.
+    // blob: URLs must not be stored.
+    match /creations/{creationId} {
+      allow read: if true;
+      allow create: if isAuth()
+                    && request.resource.data.creatorId == request.auth.uid
+                    && request.resource.data.keys().hasAll(['type','title','creatorId'])
+                    && notBlob(request.resource.data.get('title',''));
+      allow update: if isAuth()
+                    && (
+                      // Creator can edit their own creation
+                      resource.data.creatorId == request.auth.uid
+                      // OR any user incrementing likes/plays/comments counters only
+                      || (request.resource.data.diff(resource.data).affectedKeys()
+                            .hasOnly(['likes','plays','comments']))
+                    );
+      allow delete: if isAuth() && resource.data.creatorId == request.auth.uid;
+
+      // ── comments subcollection ─────────────────────────────
+      match /comments/{commentId} {
+        allow read:   if true;
+        allow create: if isAuth()
+                      && request.resource.data.uid == request.auth.uid
+                      && request.resource.data.keys().hasAll(['uid','author','text','createdAt']);
+        allow update: if isAuth() && resource.data.uid == request.auth.uid;
+        allow delete: if isAuth() && resource.data.uid == request.auth.uid;
+      }
+    }
+
+    // ── likes ─────────────────────────────────────────────────
+    // Document ID is {uid}_{creationId}.
+    // Only the owning user can create/delete their own like.
+    match /likes/{likeId} {
+      allow read:   if true;
+      allow create: if isAuth()
+                    && request.resource.data.uid == request.auth.uid
+                    && request.resource.data.keys().hasAll(['uid','creationId','createdAt']);
+      allow delete: if isAuth() && resource.data.uid == request.auth.uid;
+      allow update: if false; // likes are immutable — delete and re-create
+    }
+
+    // ── collections ───────────────────────────────────────────
+    // Everyone can read. Authenticated users can create.
+    // Only the creator can update/delete their own collection.
+    match /collections/{collectionId} {
+      allow read:   if true;
+      allow create: if isAuth()
+                    && request.resource.data.creatorId == request.auth.uid
+                    && request.resource.data.keys().hasAll(['name','creatorId','creations']);
+      allow update: if isAuth() && resource.data.creatorId == request.auth.uid;
+      allow delete: if isAuth() && resource.data.creatorId == request.auth.uid;
+    }
+  }
+}
