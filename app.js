@@ -268,19 +268,29 @@ async function loadMyLikes(uid) {
 }
 
 async function loadMyProfile(uid) {
-  const ref = doc(db, 'users', uid);
+  const ref  = doc(db, 'users', uid);
   const snap = await getDoc(ref);
   if (snap.exists()) {
     State.myProfile = { id: uid, ...snap.data() };
   } else {
-    // First login — no profile yet (created during sign-up)
-    State.myProfile = {
-      id: uid,
-      username: State.currentUser?.displayName || 'creator',
-      displayName: State.currentUser?.displayName || 'Creator',
+    // Existing Firebase Auth account with no Firestore profile yet.
+    // Create a safe default profile document so the account works everywhere.
+    const displayName = State.currentUser?.displayName || 'Creator';
+    const username    = displayName.toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '') || 'creator';
+    const profileData = {
+      uid,
+      username,
+      usernameLower: username.toLowerCase(),
+      displayName,
       bio: '',
-      createdAt: Date.now(),
+      createdAt: serverTimestamp(),
     };
+    try {
+      await setDoc(ref, profileData);
+    } catch (e) {
+      console.warn('Could not write default profile to Firestore:', e);
+    }
+    State.myProfile = { id: uid, ...profileData, createdAt: Date.now() };
   }
 }
 
@@ -320,16 +330,24 @@ function subscribeCollections() {
 
 // ─── Auth state change ────────────────────────────────────────
 
+// Resolves when onAuthStateChanged fires at least once.
+// Used by DOMContentLoaded so the router waits for Firebase Auth.
+let _authReadyResolve;
+const authReady = new Promise(resolve => { _authReadyResolve = resolve; });
+
 onAuthStateChanged(auth, async user => {
   State.currentUser = user;
   updateAuthNav();
 
   if (user) {
     await Promise.all([loadMyProfile(user.uid), loadMyLikes(user.uid)]);
+    updateAuthNav(); // refresh now that myProfile is populated
   } else {
     State.myProfile = null;
     State.myLikes.clear();
   }
+
+  _authReadyResolve(); // signal that Auth state is known
 
   // Seed + subscribe regardless of auth state (public reads allowed)
   await maybeSeedFirestore();
@@ -449,7 +467,8 @@ window.submitLogin = async function() {
 
 window.submitSignup = async function() {
   const name     = document.getElementById('auth-signup-name')?.value?.trim();
-  const username = document.getElementById('auth-signup-username')?.value?.trim().toLowerCase().replace(/\s+/g,'_');
+  const rawUser  = document.getElementById('auth-signup-username')?.value?.trim();
+  const username = rawUser?.toLowerCase().replace(/\s+/g,'_').replace(/[^a-z0-9_]/g,'');
   const email    = document.getElementById('auth-signup-email')?.value?.trim();
   const pw       = document.getElementById('auth-signup-pw')?.value;
   const errEl    = document.getElementById('auth-signup-error');
@@ -462,15 +481,21 @@ window.submitSignup = async function() {
 
   try {
     const cred = await createUserWithEmailAndPassword(auth, email, pw);
+    const uid  = cred.user.uid;
     await updateProfile(cred.user, { displayName: name });
 
-    // Create Firestore user profile
-    await setDoc(doc(db, 'users', cred.user.uid), clean({
-      username, displayName: name, bio: '',
-      email, createdAt: serverTimestamp(),
+    // Create Firestore user profile keyed by Firebase Auth UID
+    await setDoc(doc(db, 'users', uid), clean({
+      uid,
+      username,
+      usernameLower: username.toLowerCase(),
+      displayName: name,
+      bio: '',
+      email,
+      createdAt: serverTimestamp(),
     }));
 
-    State.myProfile = { id: cred.user.uid, username, displayName: name, bio: '' };
+    State.myProfile = { id: uid, uid, username, displayName: name, bio: '' };
     Modal.close();
     Toast.success(`Welcome to Shadow of Salem, ${name}!`);
     navigate('profile', { profileId: 'my' });
@@ -1260,23 +1285,63 @@ const Pages = {
       return;
     }
 
-    // For own profile use live data; for others fetch asynchronously
+    // Show loading state immediately — never show "Creator not found" before lookup completes
+    container.innerHTML = `<div style="padding:40px;text-align:center;color:var(--text-muted)">Loading creator…</div>`;
+
     if (isOwn) {
-      const profile    = State.myProfile;
-      const creations  = State.creations.filter(c => c.creatorId === State.currentUser.uid);
-      renderProfileHTML(container, profile, creations, true);
+      // Own profile: State.myProfile is populated by onAuthStateChanged → loadMyProfile.
+      // If it is already available render immediately; otherwise wait briefly.
+      const render = () => {
+        const profile   = State.myProfile;
+        const creations = State.creations.filter(c => c.creatorId === State.currentUser.uid);
+        renderProfileHTML(container, profile, creations, true);
+      };
+      if (State.myProfile) {
+        render();
+      } else {
+        // myProfile not yet loaded — fetch directly
+        getDoc(doc(db, 'users', State.currentUser.uid)).then(snap => {
+          if (snap.exists()) {
+            State.myProfile = { id: State.currentUser.uid, ...snap.data() };
+          }
+          render();
+        }).catch(err => {
+          console.error('profile fetch error:', err);
+          render(); // render with whatever myProfile fallback we have
+        });
+      }
     } else {
-      // Load other user's profile from Firestore
-      container.innerHTML = `<div style="padding:40px;text-align:center;color:var(--text-muted)">Loading…</div>`;
+      // Another user's profile — load from Firestore by UID
       getDoc(doc(db, 'users', profileId)).then(snap => {
-        const profile   = snap.exists() ? { id: profileId, ...snap.data() } : null;
-        const creations = State.creations.filter(c => c.creatorId === profileId);
-        renderProfileHTML(container, profile, creations, false);
-      }).catch(() => {
-        // Fall back to seed creator label if profile doc doesn't exist
-        const creations = State.creations.filter(c => c.creatorId === profileId);
-        const creator   = creations[0]?.creator || 'Creator';
-        renderProfileHTML(container, { id: profileId, username: creator, displayName: creator, bio: '' }, creations, false);
+        if (snap.exists()) {
+          const profile   = { id: profileId, ...snap.data() };
+          const creations = State.creations.filter(c => c.creatorId === profileId);
+          renderProfileHTML(container, profile, creations, false);
+        } else {
+          // No Firestore profile doc for this UID — try to show something useful
+          // using cached creation data (e.g. seed creators)
+          const creations = State.creations.filter(c => c.creatorId === profileId);
+          if (creations.length > 0) {
+            const creator = creations[0].creator || profileId;
+            renderProfileHTML(
+              container,
+              { id: profileId, username: creator, displayName: creator, bio: '' },
+              creations,
+              false
+            );
+          } else {
+            // Genuinely not found after lookup completed
+            renderProfileHTML(container, null, [], false);
+          }
+        }
+      }).catch(err => {
+        console.error('Creator profile load error:', err);
+        const code = err?.code || '';
+        let msg = 'Could not load creator profile.';
+        if (code === 'permission-denied')  msg = 'You do not have permission to view this profile.';
+        else if (code === 'unavailable' || code === 'network-request-failed')
+          msg = 'Network error — check your connection and try again.';
+        container.innerHTML = `<div class="empty-state"><h3>${esc(msg)}</h3><button class="btn btn-ghost mt-md" onclick="navigate('stream')">← Stream</button></div>`;
       });
     }
   },
@@ -1875,18 +1940,37 @@ window.openEditProfileModal = function() {
 };
 
 window.saveProfile = async function() {
-  const name     = document.getElementById('ep-name')?.value?.trim();
-  const username = document.getElementById('ep-username')?.value?.trim();
-  const bio      = document.getElementById('ep-bio')?.value?.trim() || '';
+  const name        = document.getElementById('ep-name')?.value?.trim();
+  const rawUsername = document.getElementById('ep-username')?.value?.trim();
+  const username    = rawUsername
+    ? rawUsername.toLowerCase().replace(/\s+/g,'_').replace(/[^a-z0-9_]/g,'')
+    : (State.myProfile?.username || '');
+  const bio = document.getElementById('ep-bio')?.value?.trim() || '';
   if (!name) { Toast.error('Display name is required.'); return; }
 
   const uid = State.currentUser?.uid;
   if (!uid) return;
 
-  await updateDoc(doc(db, 'users', uid), clean({ displayName: name, username: username || undefined, bio }));
+  const updates = clean({
+    uid,
+    displayName:   name,
+    username:      username || undefined,
+    usernameLower: username ? username.toLowerCase() : undefined,
+    bio,
+  });
+
+  // Use setDoc with merge so this works even if the Firestore doc doesn't exist yet
+  await setDoc(doc(db, 'users', uid), updates, { merge: true });
   await updateProfile(auth.currentUser, { displayName: name });
 
-  State.myProfile = { ...State.myProfile, displayName: name, username: username || State.myProfile?.username, bio };
+  State.myProfile = {
+    ...State.myProfile,
+    uid,
+    displayName: name,
+    username: username || State.myProfile?.username,
+    usernameLower: username ? username.toLowerCase() : State.myProfile?.usernameLower,
+    bio,
+  };
   updateAuthNav();
   Modal.close();
   Toast.success('Profile updated!');
@@ -1912,7 +1996,12 @@ document.addEventListener('keydown', (e) => {
 
 // ─── Init ─────────────────────────────────────────────────────
 
-document.addEventListener('DOMContentLoaded', () => {
+document.addEventListener('DOMContentLoaded', async () => {
+  // Wait for Firebase Auth to resolve before routing.
+  // This prevents the profile page from rendering with currentUser=null
+  // for users who are already signed in.
+  await authReady;
+
   const hash = window.location.hash.replace('#/', '').split('/');
   const page = hash[0] || 'stream';
   const id   = hash[1] || null;
