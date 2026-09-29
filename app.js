@@ -267,31 +267,43 @@ async function loadMyLikes(uid) {
   snap.forEach(d => State.myLikes.add(d.data().creationId));
 }
 
+// Set to true while submitSignup owns the Firestore profile write.
+// loadMyProfile skips its own repair attempt to avoid racing submitSignup.
+let _signupInProgress = false;
+
 async function loadMyProfile(uid) {
   const ref  = doc(db, 'users', uid);
   const snap = await getDoc(ref);
   if (snap.exists()) {
     State.myProfile = { id: uid, ...snap.data() };
-  } else {
-    // Existing Firebase Auth account with no Firestore profile yet.
-    // Create a safe default profile document so the account works everywhere.
-    const displayName = State.currentUser?.displayName || 'Creator';
-    const username    = displayName.toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '') || 'creator';
-    const profileData = {
-      uid,
-      username,
-      usernameLower: username.toLowerCase(),
-      displayName,
-      bio: '',
-      createdAt: serverTimestamp(),
-    };
-    try {
-      await setDoc(ref, profileData);
-    } catch (e) {
-      console.warn('Could not write default profile to Firestore:', e);
-    }
-    State.myProfile = { id: uid, ...profileData, createdAt: Date.now() };
+    return;
   }
+
+  // If submitSignup is handling the profile creation, don't race it.
+  if (_signupInProgress) {
+    // Leave State.myProfile null — submitSignup will set it after its write.
+    console.info('loadMyProfile: signup in progress, skipping repair for uid =', uid);
+    return;
+  }
+
+  // Existing Firebase Auth account with no Firestore profile yet — repair it.
+  const displayName = State.currentUser?.displayName || 'Creator';
+  const username    = displayName.toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '') || 'creator';
+  const profileData = {
+    uid,
+    username,
+    usernameLower: username.toLowerCase(),
+    displayName,
+    bio: '',
+    createdAt: serverTimestamp(),
+  };
+  try {
+    await setDoc(ref, profileData);
+    console.info('loadMyProfile: repaired missing profile for uid =', uid);
+  } catch (e) {
+    console.warn('loadMyProfile: could not repair profile (code:', e.code, '):', e.message);
+  }
+  State.myProfile = { id: uid, ...profileData, createdAt: Date.now() };
 }
 
 // Real-time listener for creations (unsubscribe handle)
@@ -500,6 +512,10 @@ window.submitSignup = async function() {
   }
 
   // ── Stage B: create Firebase Auth account ────────────────────
+  // Set flag BEFORE calling createUserWithEmailAndPassword so that
+  // onAuthStateChanged (which fires immediately on success) knows
+  // submitSignup owns the Firestore profile write and must not race it.
+  _signupInProgress = true;
   let uid;
   let authUser;
   try {
@@ -508,6 +524,7 @@ window.submitSignup = async function() {
     uid      = cred.user.uid;
     console.info('submitSignup: Auth account created, uid =', uid);
   } catch (e) {
+    _signupInProgress = false;
     // Log the real Firebase error — never log the password.
     console.error('submitSignup Auth error:', e.code, e.message, e.name, e);
     showErr(friendlyAuthError(e.code, e));
@@ -525,6 +542,8 @@ window.submitSignup = async function() {
   // ── Stage D: create Firestore profile ────────────────────────
   // Auth succeeded. If Firestore fails, the account still exists — we must
   // NOT re-run createUserWithEmailAndPassword (would get email-already-in-use).
+  // We retry up to 3 times with a brief delay because the Firestore auth token
+  // can take a moment to propagate after a brand-new account is created.
   const profileData = clean({
     uid,
     username,
@@ -534,18 +553,34 @@ window.submitSignup = async function() {
     email,
     createdAt:    serverTimestamp(),
   });
-  try {
-    await setDoc(doc(db, 'users', uid), profileData);
-    console.info('submitSignup: Firestore profile written for uid =', uid);
-  } catch (e) {
+
+  let fsError = null;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      await setDoc(doc(db, 'users', uid), profileData);
+      fsError = null;
+      console.info(`submitSignup: Firestore profile written for uid = ${uid} (attempt ${attempt})`);
+      break;
+    } catch (e) {
+      fsError = e;
+      console.warn(`submitSignup: Firestore write attempt ${attempt} failed:`, e.code, e.message);
+      if (attempt < 3) {
+        // Brief pause before retry — gives the auth token time to propagate.
+        await new Promise(r => setTimeout(r, 600 * attempt));
+      }
+    }
+  }
+
+  _signupInProgress = false;
+
+  if (fsError) {
     // Log the actual Firestore error — this is separate from Auth.
-    console.error('submitSignup Firestore error (Auth succeeded, uid =', uid, '):', e.code, e.message, e);
-    // Auth succeeded — let the user in even if Firestore write failed.
-    // loadMyProfile will attempt repair on next onAuthStateChanged.
-    const fsErrMsg = e.code === 'permission-denied'
-      ? 'Account created, but profile could not be saved (permission denied). Sign out and sign back in to repair.'
-      : `Account created, but profile save failed (${e.code || 'unknown'}). Your account works — try signing in.`;
-    // Still proceed: Auth account is real, close modal, show warning.
+    console.error('submitSignup Firestore error (Auth succeeded, uid =', uid, '):', fsError.code, fsError.message, fsError);
+    // Auth succeeded — let the user in even if profile write ultimately failed.
+    // loadMyProfile will attempt repair on the next sign-in cycle.
+    const fsErrMsg = fsError.code === 'permission-denied'
+      ? 'Account created! Profile setup hit a permissions issue — it will repair on next sign-in.'
+      : `Account created! Profile setup failed (${fsError.code || 'unknown error'}) — sign in to continue.`;
     State.myProfile = { id: uid, uid, username, displayName: name, bio: '' };
     Modal.close();
     Toast.info(fsErrMsg);
