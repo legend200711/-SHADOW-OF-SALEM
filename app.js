@@ -472,37 +472,92 @@ window.submitSignup = async function() {
   const email    = document.getElementById('auth-signup-email')?.value?.trim();
   const pw       = document.getElementById('auth-signup-pw')?.value;
   const errEl    = document.getElementById('auth-signup-error');
+  if (!errEl) { console.error('submitSignup: auth-signup-error element not found'); return; }
+
+  const showErr = (msg) => { errEl.textContent = msg; errEl.style.display = 'block'; };
   errEl.style.display = 'none';
 
-  if (!name)     { errEl.textContent = 'Display name is required.'; errEl.style.display = 'block'; return; }
-  if (!username) { errEl.textContent = 'Username is required.';     errEl.style.display = 'block'; return; }
-  if (!email)    { errEl.textContent = 'Email is required.';        errEl.style.display = 'block'; return; }
-  if (!pw || pw.length < 6) { errEl.textContent = 'Password must be at least 6 characters.'; errEl.style.display = 'block'; return; }
+  if (!name)     { showErr('Display name is required.'); return; }
+  if (!username) { showErr('Username is required.'); return; }
+  if (!email)    { showErr('Email is required.'); return; }
+  if (!pw)       { showErr('Password is required.'); return; }
 
+  // ── Stage A: check username availability ─────────────────────
+  // Query before creating the Auth account so we don't leave an
+  // orphaned Auth user if the username is already taken.
+  try {
+    const uSnap = await getDocs(
+      query(collection(db, 'users'), where('usernameLower', '==', username.toLowerCase()), limit(1))
+    );
+    if (!uSnap.empty) {
+      showErr(`The username "@${username}" is already taken.`);
+      return;
+    }
+  } catch (e) {
+    // Username check failing (e.g. Firestore not provisioned, no index) should
+    // not block signup — log the real error and continue.
+    console.warn('submitSignup: username uniqueness check failed:', e.code, e.message, e);
+  }
+
+  // ── Stage B: create Firebase Auth account ────────────────────
+  let uid;
+  let authUser;
   try {
     const cred = await createUserWithEmailAndPassword(auth, email, pw);
-    const uid  = cred.user.uid;
-    await updateProfile(cred.user, { displayName: name });
+    authUser = cred.user;
+    uid      = cred.user.uid;
+    console.info('submitSignup: Auth account created, uid =', uid);
+  } catch (e) {
+    // Log the real Firebase error — never log the password.
+    console.error('submitSignup Auth error:', e.code, e.message, e.name, e);
+    showErr(friendlyAuthError(e.code, e));
+    return; // Stop here — do NOT attempt Firestore.
+  }
 
-    // Create Firestore user profile keyed by Firebase Auth UID
-    await setDoc(doc(db, 'users', uid), clean({
-      uid,
-      username,
-      usernameLower: username.toLowerCase(),
-      displayName: name,
-      bio: '',
-      email,
-      createdAt: serverTimestamp(),
-    }));
+  // ── Stage C: set display name on Auth profile ─────────────────
+  try {
+    await updateProfile(authUser, { displayName: name });
+  } catch (e) {
+    // Non-fatal — display name update failed but account exists.
+    console.warn('submitSignup: updateProfile failed (non-fatal):', e.code, e.message);
+  }
 
+  // ── Stage D: create Firestore profile ────────────────────────
+  // Auth succeeded. If Firestore fails, the account still exists — we must
+  // NOT re-run createUserWithEmailAndPassword (would get email-already-in-use).
+  const profileData = clean({
+    uid,
+    username,
+    usernameLower: username.toLowerCase(),
+    displayName:  name,
+    bio:          '',
+    email,
+    createdAt:    serverTimestamp(),
+  });
+  try {
+    await setDoc(doc(db, 'users', uid), profileData);
+    console.info('submitSignup: Firestore profile written for uid =', uid);
+  } catch (e) {
+    // Log the actual Firestore error — this is separate from Auth.
+    console.error('submitSignup Firestore error (Auth succeeded, uid =', uid, '):', e.code, e.message, e);
+    // Auth succeeded — let the user in even if Firestore write failed.
+    // loadMyProfile will attempt repair on next onAuthStateChanged.
+    const fsErrMsg = e.code === 'permission-denied'
+      ? 'Account created, but profile could not be saved (permission denied). Sign out and sign back in to repair.'
+      : `Account created, but profile save failed (${e.code || 'unknown'}). Your account works — try signing in.`;
+    // Still proceed: Auth account is real, close modal, show warning.
     State.myProfile = { id: uid, uid, username, displayName: name, bio: '' };
     Modal.close();
-    Toast.success(`Welcome to Shadow of Salem, ${name}!`);
+    Toast.info(fsErrMsg);
     navigate('profile', { profileId: 'my' });
-  } catch (e) {
-    errEl.textContent = friendlyAuthError(e.code);
-    errEl.style.display = 'block';
+    return;
   }
+
+  // ── Stage E: success ─────────────────────────────────────────
+  State.myProfile = { id: uid, uid, username, displayName: name, bio: '' };
+  Modal.close();
+  Toast.success(`Welcome to Shadow of Salem, ${name}!`);
+  navigate('profile', { profileId: 'my' });
 };
 
 window.openResetModal = function() {
@@ -554,18 +609,21 @@ window.handleSignOut = async function() {
   navigate('stream');
 };
 
-function friendlyAuthError(code) {
+function friendlyAuthError(code, raw) {
   const map = {
-    'auth/user-not-found':        'No account found with that email.',
-    'auth/wrong-password':        'Incorrect password.',
-    'auth/invalid-email':         'Invalid email address.',
-    'auth/email-already-in-use':  'An account with that email already exists.',
-    'auth/weak-password':         'Password must be at least 6 characters.',
-    'auth/too-many-requests':     'Too many attempts. Try again later.',
-    'auth/invalid-credential':    'Invalid email or password.',
-    'auth/network-request-failed':'Network error. Check your connection.',
+    'auth/user-not-found':           'No account found with that email.',
+    'auth/wrong-password':           'Incorrect password.',
+    'auth/invalid-email':            'Please enter a valid email address.',
+    'auth/email-already-in-use':     'An account already exists with this email.',
+    'auth/weak-password':            raw?.message?.replace('Firebase: ', '') || 'Password is too weak.',
+    'auth/too-many-requests':        'Too many attempts. Try again later.',
+    'auth/invalid-credential':       'Invalid email or password.',
+    'auth/network-request-failed':   'Unable to connect to Firebase. Check your connection.',
+    'auth/operation-not-allowed':    'Email/password signup is not enabled. Contact the site admin.',
+    'auth/user-disabled':            'This account has been disabled.',
+    'auth/missing-password':         'Please enter a password.',
   };
-  return map[code] || 'Something went wrong. Please try again.';
+  return map[code] || `Something went wrong (${code || 'unknown'}). See console for details.`;
 }
 
 // ─── Firestore data actions ───────────────────────────────────
