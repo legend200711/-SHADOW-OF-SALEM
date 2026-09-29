@@ -675,6 +675,25 @@ async function fsIncrementPlays(creationId) {
   } catch (_) { /* non-critical */ }
 }
 
+async function fsUpdateCreation(creationId, fields) {
+  if (!State.currentUser) return;
+  const c = State.getCreation(creationId);
+  if (!c || c.creatorId !== State.currentUser.uid) {
+    Toast.error('You can only edit your own creations.'); return;
+  }
+  await updateDoc(doc(db, 'creations', creationId), clean(fields));
+}
+
+async function fsDeleteCreation(creationId) {
+  if (!State.currentUser) return;
+  const c = State.getCreation(creationId);
+  if (!c || c.creatorId !== State.currentUser.uid) {
+    Toast.error('You can only delete your own creations.'); return;
+  }
+  await deleteDoc(doc(db, 'creations', creationId));
+  LocalMedia.clear(creationId);
+}
+
 // ─── Router ───────────────────────────────────────────────────
 
 // Build the canonical hash string for a page + params.
@@ -1034,7 +1053,7 @@ function esc(str) {
   return String(str || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 function typeColor(type) {
-  return { music: 'blue', art: 'purple', video: 'gold', audio: 'green' }[type] || 'blue';
+  return { music: 'blue', art: 'purple', video: 'gold', audio: 'green', text: 'blue' }[type] || 'blue';
 }
 function typeIcon(type) {
   const icons = {
@@ -1042,6 +1061,7 @@ function typeIcon(type) {
     art:   `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="10"/><path d="M8.56 2.75c4.37 6.03 6.02 9.42 8.03 17.72m2.54-15.38c-3.72 4.35-8.94 5.66-16.88 5.85m19.5 1.9c-3.5-.93-6.63-.82-8.94 0-2.58.92-5.01 2.86-7.44 6.32"/></svg>`,
     video: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2" ry="2"/></svg>`,
     audio: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 010 7.07"/></svg>`,
+    text:  `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>`,
   };
   return icons[type] || icons.music;
 }
@@ -1311,14 +1331,15 @@ const Pages = {
       </div>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:var(--space-lg);margin-bottom:var(--space-xl)" id="create-type-grid">
         ${[
-          { type:'music', label:'Upload Music',        sub:'MP3, WAV, FLAC, AAC' },
-          { type:'audio', label:'Upload Audio',        sub:'Podcasts, beats, sound effects' },
-          { type:'video', label:'Upload Video',        sub:'MP4, MOV, WebM' },
-          { type:'art',   label:'Upload Art / Image',  sub:'PNG, JPG, WebP, GIF' },
+          { type:'music',  label:'Upload Music',        sub:'MP3, WAV, FLAC, AAC' },
+          { type:'audio',  label:'Upload Audio',        sub:'Podcasts, beats, sound effects' },
+          { type:'video',  label:'Upload Video',        sub:'MP4, MOV, WebM' },
+          { type:'art',    label:'Upload Art / Image',  sub:'PNG, JPG, WebP, GIF' },
+          { type:'text',   label:'Write Something',     sub:'Post a thought, story, or update', icon:'text' },
         ].map(t => `
           <button class="creation-card" style="text-align:left;padding:24px;cursor:pointer"
                   onclick="showUploadForm('${t.type}')">
-            <div style="width:48px;height:48px;color:var(--electric);margin-bottom:12px">${typeIcon(t.type)}</div>
+            <div style="width:48px;height:48px;color:var(--electric);margin-bottom:12px">${t.icon === 'text' ? `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>` : typeIcon(t.type)}</div>
             <div style="font-size:1rem;font-weight:700;margin-bottom:4px">${t.label}</div>
             <div style="font-size:0.8rem;color:var(--text-muted)">${t.sub}</div>
           </button>
@@ -1438,10 +1459,12 @@ const Pages = {
       container.innerHTML = `<div class="empty-state"><h3>Creation not found</h3><button class="btn btn-ghost mt-md" onclick="navigate('stream')">← Stream</button></div>`;
       return;
     }
-    const liked   = State.isLiked(c.id);
-    const isAudio = c.type === 'music' || c.type === 'audio';
-    const isVideo = c.type === 'video';
-    const media   = LocalMedia.get(c.id);
+    const liked    = State.isLiked(c.id);
+    const isAudio  = c.type === 'music' || c.type === 'audio';
+    const isVideo  = c.type === 'video';
+    const isText   = c.type === 'text';
+    const isOwner  = !!(State.currentUser && c.creatorId === State.currentUser.uid);
+    const media    = LocalMedia.get(c.id);
 
     container.innerHTML = `
       <div class="viewer-page">
@@ -1492,6 +1515,8 @@ const Pages = {
                      <p style="color:var(--text-muted);font-size:0.85rem">Video is local to the uploader's device and not available here.</p>
                    </div>`}
             </div>
+          ` : isText ? `
+            <div style="display:none"></div>
           ` : `
             <div style="min-height:300px;display:flex;align-items:center;justify-content:center;padding:24px;background:${esc(c.coverColor||'var(--omega-surface)')}">
               ${media.coverURL
@@ -1502,7 +1527,6 @@ const Pages = {
         </div>
 
         <div class="viewer-meta">
-          <div class="viewer-title">${esc(c.title)}</div>
           <div class="viewer-creator-row">
             <img src="${avatarUrl(c.creator)}" class="avatar avatar-sm" alt="${esc(c.creator)}"
                  onclick="navigate('profile',{profileId:'${esc(c.creatorId)}'})" style="cursor:pointer">
@@ -1513,7 +1537,12 @@ const Pages = {
             <span style="margin-left:auto;font-size:0.75rem;color:var(--text-muted)">${timeAgo(c.createdAt)}</span>
           </div>
 
-          ${c.description ? `<div class="viewer-description">${esc(c.description)}</div>` : ''}
+          ${c.description ? `
+          <div class="viewer-creator-note" id="viewer-creator-note">
+            <div class="viewer-creator-note-text">${esc(c.description)}</div>
+          </div>` : ''}
+
+          ${isText ? '' : `<div class="viewer-title">${esc(c.title)}</div>`}
           ${c.tags?.length ? `<div class="card-tags mb-md">${c.tags.map(t=>`<span class="card-tag">#${esc(t)}</span>`).join('')}</div>` : ''}
 
           <div class="viewer-actions mb-lg">
@@ -1529,6 +1558,15 @@ const Pages = {
             <button class="btn btn-ghost" onclick="navigate('profile',{profileId:'${esc(c.creatorId)}'})">
               View Creator
             </button>
+            ${isOwner ? `
+            <button class="btn btn-ghost btn-sm" style="margin-left:auto" onclick="openEditCreationModal('${esc(c.id)}')">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+              Edit
+            </button>
+            <button class="btn btn-ghost btn-sm" style="color:var(--danger)" onclick="confirmDeleteCreation('${esc(c.id)}')">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4h6v2"/></svg>
+              Delete
+            </button>` : ''}
           </div>
 
           <div class="omega-divider"></div>
@@ -1749,35 +1787,55 @@ window.showUploadForm = function(type) {
   wrap.classList.remove('hidden');
   wrap.scrollIntoView({ behavior: 'smooth', block: 'start' });
 
-  const accepts = { music: 'audio/*', audio: 'audio/*', video: 'video/*', art: 'image/*' };
-  const labels  = { music: 'Audio File', audio: 'Audio File', video: 'Video File', art: 'Image File' };
+  const accepts    = { music: 'audio/*', audio: 'audio/*', video: 'video/*', art: 'image/*' };
+  const fileLabels = { music: 'Audio File', audio: 'Audio File', video: 'Video File', art: 'Image File' };
+  const isTextOnly = type === 'text';
+
+  const typeNames = { music:'Music', audio:'Audio', video:'Video', art:'Art', text:'Post' };
+  const typeName  = typeNames[type] || type.charAt(0).toUpperCase()+type.slice(1);
 
   wrap.innerHTML = `
     <div class="creation-card" style="padding:var(--space-lg);margin-bottom:var(--space-lg)">
       <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:var(--space-lg)">
-        <div style="font-size:1.05rem;font-weight:700">New ${type.charAt(0).toUpperCase()+type.slice(1)} Creation</div>
+        <div style="font-size:1.05rem;font-weight:700">New ${typeName} Creation</div>
         <button class="btn btn-ghost btn-sm" onclick="document.getElementById('upload-form-wrap').classList.add('hidden')">✕</button>
       </div>
+
+      ${isTextOnly ? '' : `
       <div class="drop-zone" id="upload-drop-zone"
            onclick="document.getElementById('upload-file-input').click()"
            ondragover="event.preventDefault();this.classList.add('dragover')"
            ondragleave="this.classList.remove('dragover')"
            ondrop="handleFileDrop(event,'${type}')">
         <div class="drop-zone-icon">${typeIcon(type)}</div>
-        <div class="drop-zone-text">Click to select a ${labels[type]} or drag & drop</div>
+        <div class="drop-zone-text">Click to select a ${fileLabels[type]} or drag & drop</div>
         <div class="drop-zone-hint">File stays on your device — media is not uploaded to a server</div>
       </div>
       <input type="file" id="upload-file-input" accept="${accepts[type]}" style="display:none"
              onchange="handleFileSelected(this.files[0],'${type}')">
       <div id="upload-preview-area"></div>
+      `}
+
       <div class="form-group mt-md">
-        <label class="form-label">Title <span style="color:var(--danger)">*</span></label>
-        <input class="form-input" id="upload-title" placeholder="Give your creation a title…" maxlength="100">
+        <label class="form-label">Title ${isTextOnly ? '<span style="color:var(--text-muted);font-weight:400;font-size:0.8rem">(optional)</span>' : '<span style="color:var(--danger)">*</span>'}</label>
+        <input class="form-input" id="upload-title" placeholder="${isTextOnly ? 'Give it a title (optional)…' : 'Give your creation a title…'}" maxlength="100">
       </div>
+
       <div class="form-group">
-        <label class="form-label">Description</label>
-        <textarea class="form-input" id="upload-desc" placeholder="Tell people about this creation…" maxlength="500"></textarea>
+        <label class="form-label" style="font-size:0.92rem">
+          ${isTextOnly ? 'What\'s on your mind?' : 'Say something about this creation…'}
+          ${isTextOnly ? '<span style="color:var(--danger)">*</span>' : '<span style="color:var(--text-muted);font-weight:400;font-size:0.8rem">(optional)</span>'}
+        </label>
+        <textarea class="form-input" id="upload-desc"
+                  placeholder="${isTextOnly ? 'Share a thought, story, update, or anything on your mind…' : 'This is a new song I\'ve been working on. Here\'s what inspired it…'}"
+                  maxlength="2000"
+                  style="min-height:${isTextOnly ? '160px' : '90px'};resize:vertical"></textarea>
+        <div style="font-size:0.75rem;color:var(--text-muted);text-align:right;margin-top:4px">
+          <span id="upload-desc-count">0</span>/2000
+        </div>
       </div>
+
+      ${isTextOnly ? '' : `
       <div class="form-group">
         <label class="form-label">Category</label>
         <select class="form-input" id="upload-category">${getCategoryOptions(type)}</select>
@@ -1786,11 +1844,20 @@ window.showUploadForm = function(type) {
         <label class="form-label">Tags (comma-separated)</label>
         <input class="form-input" id="upload-tags" placeholder="e.g. ambient, space, synth">
       </div>
+      `}
+
       <div class="modal-footer" style="padding:0;margin-top:var(--space-md)">
         <button class="btn btn-ghost" onclick="document.getElementById('upload-form-wrap').classList.add('hidden')">Cancel</button>
-        <button class="btn btn-create" onclick="submitCreation('${type}')">Publish Creation</button>
+        <button class="btn btn-create" onclick="submitCreation('${type}')">Publish</button>
       </div>
     </div>`;
+
+  // Live character counter for the description textarea
+  const descEl    = document.getElementById('upload-desc');
+  const countEl   = document.getElementById('upload-desc-count');
+  if (descEl && countEl) {
+    descEl.addEventListener('input', () => { countEl.textContent = descEl.value.length; });
+  }
 };
 
 function getCategoryOptions(type) {
@@ -1835,8 +1902,18 @@ function renderFilePreview(file, type) {
 }
 
 window.submitCreation = async function(type) {
-  const title = document.getElementById('upload-title')?.value?.trim();
-  if (!title) { Toast.error('Please enter a title.'); return; }
+  const isTextOnly = type === 'text';
+  const title      = document.getElementById('upload-title')?.value?.trim();
+  const description = document.getElementById('upload-desc')?.value?.trim() || '';
+
+  // Text-only posts require at least some content (description or title)
+  if (isTextOnly && !title && !description) {
+    Toast.error('Please write something before publishing.'); return;
+  }
+  // Media creations require a title
+  if (!isTextOnly && !title) {
+    Toast.error('Please enter a title.'); return;
+  }
 
   const area      = document.getElementById('upload-preview-area');
   const localUrl  = area?.dataset?.localUrl  || null;
@@ -1846,9 +1923,9 @@ window.submitCreation = async function(type) {
     .split(',').map(t => t.trim().toLowerCase()).filter(Boolean).slice(0, 5);
 
   const creationData = {
-    type,
-    title,
-    description: document.getElementById('upload-desc')?.value?.trim() || '',
+    type:        isTextOnly ? 'text' : type,
+    title:       title || description.slice(0, 60) || 'Untitled', // auto-title for text posts
+    description,
     category:    document.getElementById('upload-category')?.value || '',
     tags,
     coverColor:  'linear-gradient(135deg,#0a000f,#1a002a,#050010)',
@@ -1862,8 +1939,7 @@ window.submitCreation = async function(type) {
   try {
     const newId = await fsAddCreation(creationData);
     document.getElementById('upload-form-wrap')?.classList.add('hidden');
-    Toast.success(`"${title}" published to Shadow of Salem!`);
-    // Navigate to the new creation
+    Toast.success(`Published to Shadow of Salem!`);
     if (newId) setTimeout(() => navigate('viewer', { id: newId }), 400);
   } catch (e) {
     Toast.error('Failed to publish. Please try again.');
@@ -2060,6 +2136,128 @@ window.saveProfile = async function() {
   Modal.close();
   Toast.success('Profile updated!');
   navigate('profile', { profileId: 'my' });
+};
+
+// ─── Edit / Delete Creation modals ───────────────────────────
+
+window.openEditCreationModal = function(creationId) {
+  const c = State.getCreation(creationId);
+  if (!c) return;
+  if (!State.currentUser || c.creatorId !== State.currentUser.uid) {
+    Toast.error('You can only edit your own creations.'); return;
+  }
+  const isTextType = c.type === 'text';
+  Modal.open(`
+    <div class="modal-header">
+      <div class="modal-title">Edit Creation</div>
+      <button type="button" class="modal-close" onclick="Modal.close()">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+      </button>
+    </div>
+    <div class="modal-body">
+      ${isTextType ? '' : `
+      <div class="form-group">
+        <label class="form-label">Title <span style="color:var(--danger)">*</span></label>
+        <input class="form-input" id="ec-title" value="${esc(c.title)}" maxlength="100">
+      </div>`}
+      <div class="form-group">
+        <label class="form-label" style="font-size:0.92rem">
+          ${isTextType ? 'Your post' : 'Say something about this creation…'}
+        </label>
+        <textarea class="form-input" id="ec-desc" maxlength="2000"
+                  placeholder="${isTextType ? 'Share a thought, story, or update…' : 'What inspired this? What\'s the story?'}"
+                  style="min-height:${isTextType ? '160px' : '90px'};resize:vertical">${esc(c.description||'')}</textarea>
+        <div style="font-size:0.75rem;color:var(--text-muted);text-align:right;margin-top:4px">
+          <span id="ec-desc-count">${(c.description||'').length}</span>/2000
+        </div>
+      </div>
+      ${isTextType ? '' : `
+      <div class="form-group">
+        <label class="form-label">Tags (comma-separated)</label>
+        <input class="form-input" id="ec-tags" value="${esc((c.tags||[]).join(', '))}" maxlength="200">
+      </div>`}
+    </div>
+    <div class="modal-footer">
+      <button type="button" class="btn btn-ghost" onclick="Modal.close()">Cancel</button>
+      <button type="button" class="btn btn-primary" onclick="saveCreation('${esc(creationId)}')">Save Changes</button>
+    </div>
+  `);
+  const descEl  = document.getElementById('ec-desc');
+  const countEl = document.getElementById('ec-desc-count');
+  if (descEl && countEl) {
+    descEl.addEventListener('input', () => { countEl.textContent = descEl.value.length; });
+  }
+};
+
+window.saveCreation = async function(creationId) {
+  const c = State.getCreation(creationId);
+  if (!c) return;
+  const isTextType = c.type === 'text';
+
+  const title       = isTextType ? c.title : (document.getElementById('ec-title')?.value?.trim() || '');
+  const description = document.getElementById('ec-desc')?.value?.trim() || '';
+  const rawTags     = document.getElementById('ec-tags')?.value || '';
+
+  if (!isTextType && !title) { Toast.error('Title is required.'); return; }
+  if (isTextType && !title && !description) { Toast.error('Please write something.'); return; }
+
+  const tags = isTextType ? (c.tags || []) :
+    rawTags.split(',').map(t => t.trim().toLowerCase()).filter(Boolean).slice(0, 5);
+
+  const updates = clean({
+    title:       title || description.slice(0, 60) || c.title,
+    description,
+    tags,
+  });
+
+  try {
+    await fsUpdateCreation(creationId, updates);
+    // Optimistically update local state
+    const idx = State.creations.findIndex(x => x.id === creationId);
+    if (idx !== -1) State.creations[idx] = { ...State.creations[idx], ...updates };
+    Modal.close();
+    Toast.success('Creation updated!');
+    // Re-render the viewer with updated data
+    navigate('viewer', { id: creationId });
+  } catch (e) {
+    Toast.error('Could not save changes. Please try again.');
+    console.error(e);
+  }
+};
+
+window.confirmDeleteCreation = function(creationId) {
+  const c = State.getCreation(creationId);
+  if (!c) return;
+  Modal.open(`
+    <div class="modal-header">
+      <div class="modal-title">Delete Creation</div>
+      <button type="button" class="modal-close" onclick="Modal.close()">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+      </button>
+    </div>
+    <div class="modal-body">
+      <p style="color:var(--text-secondary);font-size:0.9rem">
+        Are you sure you want to permanently delete <strong>${esc(c.title)}</strong>?
+        This cannot be undone.
+      </p>
+    </div>
+    <div class="modal-footer">
+      <button type="button" class="btn btn-ghost" onclick="Modal.close()">Cancel</button>
+      <button type="button" class="btn btn-danger" onclick="handleDeleteCreation('${esc(creationId)}')">Delete</button>
+    </div>
+  `);
+};
+
+window.handleDeleteCreation = async function(creationId) {
+  try {
+    await fsDeleteCreation(creationId);
+    Modal.close();
+    Toast.info('Creation deleted.');
+    navigate('stream');
+  } catch (e) {
+    Toast.error('Could not delete. Please try again.');
+    console.error(e);
+  }
 };
 
 // ─── Keyboard shortcuts ───────────────────────────────────────
