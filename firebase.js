@@ -5,10 +5,10 @@
    initializeApp() anywhere else.
 ═══════════════════════════════════════════════════════════ */
 
-import { initializeApp }             from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js';
-import { getAuth }                   from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js';
-import { getFirestore }              from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js';
-import { getAnalytics, isSupported } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-analytics.js';
+import { initializeApp }             from 'https://www.gstatic.com/firebasejs/12.19.0/firebase-app.js';
+import { getAuth }                   from 'https://www.gstatic.com/firebasejs/12.19.0/firebase-auth.js';
+import { getFirestore }              from 'https://www.gstatic.com/firebasejs/12.19.0/firebase-firestore.js';
+import { getAnalytics, isSupported } from 'https://www.gstatic.com/firebasejs/12.19.0/firebase-analytics.js';
 
 const firebaseConfig = {
   apiKey:            'AIzaSyDSxO8uyyEwWSIDW-y0-ngWrCPytzA4XmA',

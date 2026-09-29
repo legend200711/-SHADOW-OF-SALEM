@@ -14,7 +14,7 @@ import {
   sendPasswordResetEmail,
   onAuthStateChanged,
   updateProfile,
-} from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js';
+} from 'https://www.gstatic.com/firebasejs/12.19.0/firebase-auth.js';
 
 import {
   collection,
@@ -34,7 +34,7 @@ import {
   increment,
   writeBatch,
   Timestamp,
-} from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js';
+} from 'https://www.gstatic.com/firebasejs/12.19.0/firebase-firestore.js';
 
 'use strict';
 
