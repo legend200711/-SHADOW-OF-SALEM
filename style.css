@@ -1,5 +1,5 @@
 /* ═══════════════════════════════════════════════════════════
-   OMEGA UNIVERSE — DESIGN SYSTEM
+   SHADOW OF SALEM — DESIGN SYSTEM
 ═══════════════════════════════════════════════════════════ */
 
 :root {
@@ -1403,6 +1403,94 @@ select.form-input { appearance: none; cursor: pointer; }
 }
 @media (max-width: 400px) {
   .filter-tab { font-size: 0.73rem; padding: 6px 10px; }
+}
+
+/* ─── Startup Screen ─────────────────────────────────────── */
+.startup-screen {
+  position: fixed;
+  inset: 0;
+  background: var(--omega-bg);
+  z-index: 9999;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  transition: opacity 0.45s ease, visibility 0.45s ease;
+}
+.startup-screen.startup-hiding {
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+}
+.startup-screen.startup-gone {
+  display: none !important;
+}
+.startup-inner {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  text-align: center;
+  padding: 0 24px;
+}
+.startup-logo {
+  width: 72px;
+  height: 72px;
+  border-radius: 50%;
+  background: radial-gradient(circle at 40% 40%, #00c8ff, #7c3aed);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--font-brand);
+  font-size: 2.4rem;
+  font-weight: 900;
+  color: #fff;
+  box-shadow: 0 0 40px rgba(0, 200, 255, 0.45), 0 0 80px rgba(124, 58, 237, 0.25);
+  margin-bottom: 8px;
+}
+.startup-title {
+  font-family: var(--font-brand);
+  font-size: clamp(1.4rem, 5vw, 2.2rem);
+  font-weight: 900;
+  letter-spacing: 0.22em;
+  background: linear-gradient(90deg, #00c8ff, #a855f7);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+  line-height: 1.2;
+}
+.startup-tagline {
+  font-family: var(--font-brand);
+  font-size: 0.72rem;
+  letter-spacing: 0.3em;
+  color: var(--text-muted);
+  text-transform: uppercase;
+}
+.startup-status {
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+  margin-top: 24px;
+  min-height: 1.4em;
+  letter-spacing: 0.04em;
+}
+.startup-dots {
+  display: flex;
+  gap: 6px;
+  margin-top: 4px;
+}
+.startup-dots span {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--electric);
+  opacity: 0.25;
+  animation: startup-pulse 1.2s ease-in-out infinite;
+}
+.startup-dots span:nth-child(2) { animation-delay: 0.2s; }
+.startup-dots span:nth-child(3) { animation-delay: 0.4s; }
+@keyframes startup-pulse {
+  0%, 80%, 100% { opacity: 0.2; transform: scale(0.9); }
+  40%           { opacity: 1;   transform: scale(1.2); }
 }
 
 /* ─── Utility ────────────────────────────────────────────── */

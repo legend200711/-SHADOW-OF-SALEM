@@ -340,12 +340,68 @@ function subscribeCollections() {
   }, err => console.error('collections listener:', err));
 }
 
+// ─── App boot state ───────────────────────────────────────────
+// Tracks which phase the app is in:
+//   'booting'       — Firebase Auth hasn't resolved yet (startup screen showing)
+//   'guest'         — Auth resolved, no signed-in user
+//   'authenticated' — Auth resolved, user confirmed + profile loaded
+let _bootState = 'booting';
+
+// ─── Startup Screen controller ────────────────────────────────
+const Startup = {
+  _el:       null,
+  _statusEl: null,
+
+  // The element is already in the DOM from HTML — grab it once DOM is ready.
+  _init() {
+    if (this._el) return;
+    this._el       = document.getElementById('startup-screen');
+    this._statusEl = document.getElementById('startup-status');
+  },
+
+  setStatus(msg) {
+    this._init();
+    if (this._statusEl) this._statusEl.textContent = msg;
+  },
+
+  /** Fade out and remove the startup screen. */
+  dismiss() {
+    this._init();
+    if (!this._el || this._el.classList.contains('startup-hiding')) return;
+    this._el.classList.add('startup-hiding');
+    this._el.addEventListener('transitionend', () => {
+      this._el.classList.add('startup-gone');
+    }, { once: true });
+    // Safety: ensure it's gone even if transitionend never fires.
+    setTimeout(() => {
+      if (this._el) this._el.classList.add('startup-gone');
+    }, 600);
+  },
+
+  /** Show a non-blocking error message inside the startup screen. */
+  showError(msg) {
+    this._init();
+    if (this._statusEl) {
+      this._statusEl.textContent = msg;
+      this._statusEl.style.color = 'var(--danger)';
+    }
+    // Hide the dots when showing an error
+    const dots = this._el?.querySelector('.startup-dots');
+    if (dots) dots.style.display = 'none';
+  },
+};
+
 // ─── Auth state change ────────────────────────────────────────
 
 // Resolves when onAuthStateChanged fires at least once.
 // Used by DOMContentLoaded so the router waits for Firebase Auth.
 let _authReadyResolve;
 const authReady = new Promise(resolve => { _authReadyResolve = resolve; });
+let _authResolved = false; // becomes true after the first onAuthStateChanged call
+
+// True during a user-initiated login (submitLogin) so onAuthStateChanged
+// knows to navigate to stream after the login completes.
+let _loginInProgress = false;
 
 onAuthStateChanged(auth, async user => {
   State.currentUser = user;
@@ -354,17 +410,42 @@ onAuthStateChanged(auth, async user => {
   if (user) {
     await Promise.all([loadMyProfile(user.uid), loadMyLikes(user.uid)]);
     updateAuthNav(); // refresh now that myProfile is populated
+    _bootState = 'authenticated';
   } else {
     State.myProfile = null;
     State.myLikes.clear();
+    _bootState = 'guest';
   }
 
-  _authReadyResolve(); // signal that Auth state is known
+  const wasBooting = !_authResolved;
+  if (!_authResolved) {
+    _authResolved = true;
+    _authReadyResolve(); // signal that Auth state is known
+  }
 
-  // Seed + subscribe regardless of auth state (public reads allowed)
-  await maybeSeedFirestore();
-  subscribeCreations();
-  subscribeCollections();
+  // If a user-triggered login just resolved (not the initial boot), navigate
+  // to stream and update the UI immediately — no manual refresh needed.
+  if (!wasBooting && _loginInProgress && user) {
+    _loginInProgress = false;
+    navigate('stream');
+    return;
+  }
+  _loginInProgress = false;
+
+  // If a user-triggered sign-out just resolved, update UI immediately.
+  if (!wasBooting && !user) {
+    navigate('stream');
+    return;
+  }
+
+  // Seed + subscribe regardless of auth state (public reads allowed).
+  // Only run on first boot — subscribeCreations/subscribeCollections guard
+  // against duplicate listeners with their _unsub checks.
+  if (wasBooting) {
+    await maybeSeedFirestore();
+    subscribeCreations();
+    subscribeCollections();
+  }
 });
 
 // ─── Auth UI helpers ──────────────────────────────────────────
@@ -467,11 +548,23 @@ window.submitLogin = async function() {
   const errEl = document.getElementById('auth-login-error');
   errEl.style.display = 'none';
   if (!email || !pw) { errEl.textContent = 'Enter your email and password.'; errEl.style.display = 'block'; return; }
+
+  // Disable the submit button while the request is in flight.
+  const btn = document.getElementById('auth-submit-btn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Signing in…'; }
+
   try {
+    // Signal the onAuthStateChanged listener to navigate to stream
+    // once Firebase confirms the login — so there is NO manual refresh needed.
+    _loginInProgress = true;
     await signInWithEmailAndPassword(auth, email, pw);
+    // onAuthStateChanged fires next — it closes the modal, loads profile,
+    // navigates to stream, and updates the nav. Nothing more needed here.
     Modal.close();
     Toast.success('Welcome back!');
   } catch (e) {
+    _loginInProgress = false;
+    if (btn) { btn.disabled = false; btn.textContent = 'Sign In'; }
     errEl.textContent = friendlyAuthError(e.code);
     errEl.style.display = 'block';
   }
@@ -584,7 +677,7 @@ window.submitSignup = async function() {
     State.myProfile = { id: uid, uid, username, displayName: name, bio: '' };
     Modal.close();
     Toast.info(fsErrMsg);
-    navigate('profile', { profileId: 'my' });
+    navigate('stream');
     return;
   }
 
@@ -592,7 +685,7 @@ window.submitSignup = async function() {
   State.myProfile = { id: uid, uid, username, displayName: name, bio: '' };
   Modal.close();
   Toast.success(`Welcome to Shadow of Salem, ${name}!`);
-  navigate('profile', { profileId: 'my' });
+  navigate('stream');
 };
 
 window.openResetModal = function() {
@@ -640,8 +733,10 @@ window.submitReset = async function() {
 
 window.handleSignOut = async function() {
   await signOut(auth);
+  // onAuthStateChanged fires immediately after signOut resolves and handles
+  // clearing state + navigating to stream. Toast here as confirmation.
   Toast.info('Signed out.');
-  navigate('stream');
+  // Navigation is handled by onAuthStateChanged — do not call navigate() here.
 };
 
 function friendlyAuthError(code, raw) {
@@ -2373,16 +2468,49 @@ document.addEventListener('keydown', (e) => {
 // ─── Init ─────────────────────────────────────────────────────
 
 document.addEventListener('DOMContentLoaded', async () => {
-  // Wait for Firebase Auth to resolve before routing.
-  // This prevents the profile page from rendering with currentUser=null
-  // for users who are already signed in.
-  await authReady;
+  // Startup screen is already visible — it was rendered inline in HTML before
+  // any JavaScript ran, so the user never sees a blank/black page.
+  Startup._init();
+
+  // Safety timeout: if Firebase Auth takes longer than 8 seconds (e.g. offline,
+  // slow network, service outage), dismiss the startup screen and render the
+  // guest shell so the user is never left on a black screen forever.
+  const startupTimeout = setTimeout(() => {
+    if (_bootState === 'booting') {
+      console.warn('Shadow of Salem: Firebase Auth timeout — entering guest mode.');
+      _bootState = 'guest';
+      Startup.showError("We're having trouble connecting right now.");
+      // Give the user a moment to read the message, then enter guest mode.
+      setTimeout(() => {
+        const raw = window.location.hash || '#/stream';
+        const { page, params } = hashToRoute(raw);
+        navigate(page, params);
+        Startup.dismiss();
+      }, 1800);
+    }
+  }, 8000);
+
+  try {
+    // Wait for Firebase Auth to resolve before routing.
+    // This prevents the profile page from rendering with currentUser=null
+    // for users who are already signed in (e.g. returning session restore).
+    await authReady;
+    clearTimeout(startupTimeout);
+  } catch (err) {
+    clearTimeout(startupTimeout);
+    console.error('Shadow of Salem: Auth initialisation error:', err);
+    Startup.showError("We're having trouble connecting right now.");
+    await new Promise(r => setTimeout(r, 1800));
+  }
 
   // Parse the current URL hash using the canonical router.
   // If no hash is present, default to stream.
   const raw = window.location.hash || '#/stream';
   const { page, params } = hashToRoute(raw);
   navigate(page, params);
+
+  // Smoothly remove the startup screen now that the app is ready.
+  Startup.dismiss();
 });
 
 // Expose to HTML onclick handlers

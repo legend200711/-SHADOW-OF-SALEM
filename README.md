@@ -1,35 +1,52 @@
-# OMEGA UNIVERSE
+# SHADOW OF SALEM
 ## CREATE · DISCOVER · EXPERIENCE
 
-A **frontend-only** digital creation universe. No backend, no database, no authentication required.
+A **production web application** for digital creators. Upload, publish, and discover music, art, video, and more — powered by Firebase Authentication and Cloud Firestore.
 
 ---
 
-## What Is Omega Universe?
+## What Is Shadow of Salem?
 
-Omega Universe is a **digital creation platform** — not a social network.
+Shadow of Salem is a **digital creation platform** — not a social network.
 
 People use it to:
 - Upload and publish **music, audio, beats, and mixes**
 - Share **digital art, illustrations, and photography**
 - Post **videos and short films**
+- Write **text-based posts and creator notes**
 - Organise creations into **Collections**
-- Discover creations in the **Omega Stream** and **Omega Gallery**
+- Discover creations in the **Shadow Stream** and Gallery
 - Play audio through the **Omega Player** (persistent, full-featured)
+- Build and manage a **Creator Profile**
 
 ---
 
 ## Architecture
 
 ```
-omega-universe/
-├── index.html      — App shell, navigation, persistent player
+shadow-of-salem/
+├── index.html      — App shell, startup screen, navigation, persistent player
 ├── style.css       — Full design system (dark, electric blue, cosmic)
-├── app.js          — All pages, state, player, routing
-└── manifest.json   — PWA manifest
+├── app.js          — All pages, state, player, routing, auth, Firestore
+├── firebase.js     — Firebase initialisation (single point, no duplicates)
+├── manifest.json   — PWA manifest
+└── firestore.rules — Firestore security rules
 ```
 
-**Single-file frontend prototype.** All data lives in `sessionStorage` (creations) and `localStorage` (likes, comments, profile).
+**Single-page application.** All persistent data lives in Cloud Firestore. Local media (audio/video/images) is held in memory as `blob:` URLs during the session — Firebase Storage is intentionally disabled.
+
+---
+
+## Authentication
+
+- Firebase Email/Password Authentication
+- Persistent sessions — users stay signed in across browser restarts
+- Instant state update after login/logout — **no manual refresh required**
+- Single authoritative `onAuthStateChanged` listener
+- Signup creates a Firestore profile in `users/{uid}`
+- Branded startup screen shown during Firebase Auth initialisation
+- Boot states: `booting` → `authenticated` / `guest`
+- 8-second safety timeout prevents a blank screen on slow networks
 
 ---
 
@@ -37,15 +54,17 @@ omega-universe/
 
 | Route | Description |
 |---|---|
-| Stream | Discovery stream of all digital creations |
-| Explore | Omega Gallery — browse by category with search |
-| Music | Music-only gallery |
-| Video | Video-only gallery |
-| Art | Art & images gallery |
-| Collections | Organisational groups of creations |
-| Create | Creator Space — upload and publish |
-| Search | Content-first search |
-| Profile | Your profile and creations |
+| `#/stream` | Shadow Stream — discovery feed of all creations |
+| `#/explore` | Gallery — browse by category with search |
+| `#/music` | Music-only gallery |
+| `#/video` | Video-only gallery |
+| `#/art` | Art & image gallery |
+| `#/collections` | Organisational groups of creations |
+| `#/create` | Creator Space — upload and publish |
+| `#/search` | Content-first search |
+| `#/profile/my` | Your own profile |
+| `#/profile/:id` | Any creator's profile |
+| `#/viewer/:id` | Full creation viewer |
 
 ---
 
@@ -57,17 +76,18 @@ Persistent audio player at the bottom of the screen. Supports:
 - Volume control
 - Mini-player with artwork, title, creator
 - Queue (all audio in current session)
-- Keyboard shortcut: `Space` or `K` to play/pause
+- Keyboard shortcuts: `Space` or `K` to play/pause, `Alt+←/→` for prev/next
 
 ---
 
 ## Creator Space
 
-Upload images, audio, video, and art **locally in the browser**.
+Upload images, audio, video, and art. Text-only posts also supported.
 - File preview before publishing
-- Title, description, category, tags
-- Published creations appear in Stream and profile
-- Data resets on page refresh (prototype behaviour)
+- Title, description, category, tags, creator note
+- Published creations persist in Firestore and appear across all sessions
+- Like, comment, and share creations
+- Edit and delete own creations
 
 ---
 
@@ -84,17 +104,14 @@ Upload images, audio, video, and art **locally in the browser**.
 
 ---
 
-## Source
+## Firebase
 
-Extracted and rebuilt from **Shadow Feature Library** components:
-- Audio player pattern → `shadowvoltix-main` PlayerContext + MiniPlayer
-- Media cards → `shadowvoltix-main` AudioCard
-- Gallery + lightbox → `AVENORA12-main` gallery.js
-- Upload UI → `shadow-waves-main` sfl-upload.html
-- Profile UI → `shadowvoltix-main` ProfilePage
-- Music CSS tokens → `AVENORA12-main` music.css
+- **Authentication:** Email/Password (enabled)
+- **Firestore:** `creations`, `collections`, `likes`, `users` collections
+- **Storage:** Disabled — all media is local `blob:` URLs
+- **Analytics:** Optional (gracefully disabled if blocked)
 
 ---
 
-> **Omega Universe is NOT a social network.**
+> **Shadow of Salem is NOT a social network.**
 > It is a place where digital creations live.
