@@ -38,10 +38,8 @@
 export const WORKER_URL = 'https://shadow-of-salem-r2.nthntjrn.workers.dev';
 
 // MEDIA_PUBLIC_BASE — public base URL for R2 objects (no trailing slash)
-// Set this to your R2 bucket's public URL once you enable public access.
-// Find it: Cloudflare Dashboard → R2 → shadow-of-salem-media → Settings → Public Access
-// Format:  https://pub-<hash>.r2.dev  OR  https://media.yourdomain.com
-export const MEDIA_PUBLIC_BASE = 'REPLACE_WITH_R2_PUBLIC_URL'; // e.g. https://pub-abc123.r2.dev
+// R2 bucket: shadow-of-salem-media — public r2.dev subdomain enabled
+export const MEDIA_PUBLIC_BASE = 'https://pub-6c6903723183408995d43b84b99318c9.r2.dev';
 
 // ─── Types / constants ────────────────────────────────────────
 
