@@ -52,51 +52,69 @@ function json(data, status = 200, origin = '*', env = {}) {
 }
 
 // ─── Firebase JWT verification ────────────────────────────────
-// Verifies the Firebase ID token signature using Google's public JWKs.
+// Verifies a Firebase ID token using Google's JWK public-key endpoint.
+//
+// Google publishes Firebase signing keys as JWKs at:
+//   https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com
+//
+// crypto.subtle.importKey('jwk', ...) works natively in Cloudflare Workers.
+// We do NOT use the x509 certificate endpoint — importing an X.509 cert as
+// 'spki' fails because the cert DER contains the full certificate structure,
+// not a bare SubjectPublicKeyInfo blob.
 
-const FIREBASE_CERTS_URL =
-  'https://www.googleapis.com/robot/v1/metadata/x509/securetoken@system.gserviceaccount.com';
+const FIREBASE_JWK_URL =
+  'https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com';
 
 async function verifyFirebaseToken(token, projectId) {
+  // 1. Split and base64url-decode the three JWT parts
   const parts = token.split('.');
   if (parts.length !== 3) throw new Error('Malformed JWT');
 
-  function b64url(s) {
+  function b64urlDecode(s) {
     const padded = s + '=='.slice(0, (4 - (s.length % 4)) % 4);
     return atob(padded.replace(/-/g, '+').replace(/_/g, '/'));
   }
 
-  const header  = JSON.parse(b64url(parts[0]));
-  const payload = JSON.parse(b64url(parts[1]));
+  const header  = JSON.parse(b64urlDecode(parts[0]));
+  const payload = JSON.parse(b64urlDecode(parts[1]));
 
+  // 2. Validate claims before touching the network
   const now = Math.floor(Date.now() / 1000);
-  if (payload.exp <= now)             throw new Error('Token expired');
-  if (payload.aud !== projectId)      throw new Error('Token audience mismatch');
+  if (payload.exp <= now)        throw new Error('Token expired');
+  if (payload.aud !== projectId) throw new Error('Token audience mismatch');
   const validIssuers = [
     `https://securetoken.google.com/${projectId}`,
     'https://accounts.google.com',
   ];
   if (!validIssuers.includes(payload.iss)) throw new Error('Token issuer invalid');
-  if (!payload.sub || typeof payload.sub !== 'string') throw new Error('No subject');
+  if (!payload.sub || typeof payload.sub !== 'string') throw new Error('No subject in token');
 
-  const certsResp = await fetch(FIREBASE_CERTS_URL, { cf: { cacheTtl: 3600 } });
-  if (!certsResp.ok) throw new Error('Could not fetch Firebase certs');
-  const certs = await certsResp.json();
+  // 3. Fetch Google's JWK set (cached 1 hour by Cloudflare)
+  const jwkResp = await fetch(FIREBASE_JWK_URL, { cf: { cacheTtl: 3600 } });
+  if (!jwkResp.ok) throw new Error('Could not fetch Firebase public keys');
+  const jwkSet = await jwkResp.json();
 
-  const certPem = certs[header.kid];
-  if (!certPem) throw new Error(`No cert for kid ${header.kid}`);
+  // 4. Find the JWK matching the token's key ID
+  const jwk = (jwkSet.keys || []).find(k => k.kid === header.kid);
+  if (!jwk) throw new Error(`No public key found for kid "${header.kid}"`);
 
-  const pemBody   = certPem.replace(/-----[^-]+-----/g, '').replace(/\s/g, '');
-  const derBuffer = Uint8Array.from(atob(pemBody), c => c.charCodeAt(0));
+  // 5. Import the JWK — works natively in Cloudflare Workers Web Crypto
   const cryptoKey = await crypto.subtle.importKey(
-    'spki', derBuffer,
+    'jwk',
+    jwk,
     { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
-    false, ['verify']
+    false,
+    ['verify']
   );
 
+  // 6. Verify the signature over header.payload
   const encoder  = new TextEncoder();
   const sigInput = encoder.encode(parts[0] + '.' + parts[1]);
-  const sigBytes = Uint8Array.from(b64url(parts[2]), c => c.charCodeAt(0));
+
+  // base64url → Uint8Array for the signature bytes
+  const sigRaw   = b64urlDecode(parts[2]);
+  const sigBytes = new Uint8Array(sigRaw.length);
+  for (let i = 0; i < sigRaw.length; i++) sigBytes[i] = sigRaw.charCodeAt(i);
 
   const valid = await crypto.subtle.verify(
     'RSASSA-PKCS1-v1_5', cryptoKey, sigBytes, sigInput
