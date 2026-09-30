@@ -31,13 +31,18 @@
 // configured public access on your R2 bucket.
 //
 // WORKER_URL        — the deployed Worker URL (no trailing slash)
+//   Find it: Cloudflare Dashboard → Workers & Pages → shadow-of-salem-r2 → the URL shown
+//   Format:  https://shadow-of-salem-r2.<YOUR-ACCOUNT>.workers.dev
+//
 // MEDIA_PUBLIC_BASE — the public base URL for R2 objects (no trailing slash)
+//   Find it: Cloudflare Dashboard → R2 → shadow-of-salem-media → Settings → Public Access
+//   Format:  https://pub-<hash>.r2.dev  OR  https://media.yourdomain.com
 //
 // These are NOT secrets — they are just endpoint URLs.
 // The actual R2 secret key lives only in the Worker.
 
-export const WORKER_URL        = 'https://shadow-of-salem-r2.workers.dev'; // TODO: replace with your Worker URL
-export const MEDIA_PUBLIC_BASE = 'https://pub-REPLACE.r2.dev';             // TODO: replace with your R2 public URL
+export const WORKER_URL        = 'REPLACE_WITH_WORKER_URL';   // e.g. https://shadow-of-salem-r2.abc123.workers.dev
+export const MEDIA_PUBLIC_BASE = 'REPLACE_WITH_R2_PUBLIC_URL'; // e.g. https://pub-abc123.r2.dev
 
 // ─── Types / constants ────────────────────────────────────────
 
@@ -67,27 +72,69 @@ export const MEDIA_KINDS = {
  * @returns {Promise<{ uploadUrl: string, mediaKey: string }>}
  */
 async function requestUploadAuth(idToken, uid, file, mediaKind) {
-  const resp = await fetch(`${WORKER_URL}/upload-auth`, {
-    method:  'POST',
-    headers: {
-      'Content-Type':  'application/json',
-      'Authorization': `Bearer ${idToken}`,
-    },
-    body: JSON.stringify({
-      uid,
-      fileName: file.name,
-      mimeType: file.type,
-      fileSize: file.size,
-      mediaKind,
-    }),
-  });
-
-  if (!resp.ok) {
-    const err = await resp.json().catch(() => ({ error: resp.statusText }));
-    throw new Error(err.error || `Upload auth failed (${resp.status})`);
+  // ── Guard: catch un-replaced placeholder URLs before making a useless request ──
+  if (WORKER_URL.startsWith('REPLACE_') || WORKER_URL.includes('REPLACE_WITH')) {
+    throw new Error(
+      'WORKER_URL has not been set in storage.js. ' +
+      'Open Cloudflare Dashboard → Workers & Pages → shadow-of-salem-r2 ' +
+      'and copy the Worker URL into WORKER_URL in storage.js.'
+    );
   }
 
-  return resp.json(); // { uploadUrl, mediaKey, expires }
+  const endpoint = `${WORKER_URL}/upload-auth`;
+
+  console.log('[R2] Requesting upload authorization');
+  console.log('[R2] Authorization endpoint:', endpoint);
+  console.log('[R2] mediaKind:', mediaKind, '| fileName:', file.name, '| fileSize:', file.size, '| mimeType:', file.type);
+
+  let resp;
+  try {
+    resp = await fetch(endpoint, {
+      method:  'POST',
+      headers: {
+        'Content-Type':  'application/json',
+        'Authorization': `Bearer ${idToken}`,
+      },
+      body: JSON.stringify({
+        uid,
+        fileName: file.name,
+        mimeType: file.type,
+        fileSize: file.size,
+        mediaKind,
+      }),
+    });
+  } catch (networkErr) {
+    console.error('[R2] Network error contacting Worker:', networkErr);
+    throw new Error(
+      `Network error reaching Worker at ${endpoint}. ` +
+      'Check WORKER_URL in storage.js and that the Worker is deployed.'
+    );
+  }
+
+  console.log('[R2] Authorization response status:', resp.status, resp.statusText);
+
+  if (!resp.ok) {
+    let errBody;
+    try { errBody = await resp.json(); } catch { errBody = { error: resp.statusText }; }
+    console.error('[R2] Authorization response:', errBody);
+
+    const httpLabel = {
+      400: '400 Bad Request',
+      401: '401 Authentication required',
+      403: '403 Upload not authorized',
+      404: '404 Worker endpoint not found — check WORKER_URL',
+      405: '405 Method not allowed',
+      413: '413 File too large',
+      500: '500 Worker error',
+      503: '503 Storage unavailable',
+    }[resp.status] || `HTTP ${resp.status}`;
+
+    throw new Error(`${httpLabel} — ${errBody.error || resp.statusText}`);
+  }
+
+  const result = await resp.json();
+  console.log('[R2] Authorization succeeded — mediaKey:', result.mediaKey);
+  return result; // { uploadUrl, mediaKey, expires }
 }
 
 /**

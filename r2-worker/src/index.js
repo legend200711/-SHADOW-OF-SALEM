@@ -22,7 +22,10 @@
 
 function corsHeaders(origin, env) {
   const allowed = env.ALLOWED_ORIGIN || '';
-  // During development ALLOWED_ORIGIN may contain comma-separated values
+  // ALLOWED_ORIGIN is a comma-separated list of allowed origins.
+  // Set it via: npx wrangler secret put ALLOWED_ORIGIN
+  // Value for GitHub Pages: https://<your-username>.github.io
+  // If empty, all origins are allowed (useful during initial setup).
   const allowedList = allowed.split(',').map(s => s.trim()).filter(Boolean);
   const ok = allowedList.length === 0 || allowedList.includes(origin);
   return {
@@ -121,6 +124,11 @@ async function presignPut(env, key, mimeType, expiresSeconds = 300) {
   const accessKey = env.R2_ACCESS_KEY_ID;
   const secretKey = env.R2_SECRET_ACCESS_KEY;
   const bucket    = env.MEDIA_BUCKET_NAME || 'shadow-of-salem-media';
+
+  // Guard: all three R2 credentials must be present
+  if (!accountId) throw new Error('Missing secret: R2_ACCOUNT_ID');
+  if (!accessKey) throw new Error('Missing secret: R2_ACCESS_KEY_ID');
+  if (!secretKey) throw new Error('Missing secret: R2_SECRET_ACCESS_KEY');
 
   const host      = `${accountId}.r2.cloudflarestorage.com`;
   const endpoint  = `https://${host}/${bucket}/${key}`;
