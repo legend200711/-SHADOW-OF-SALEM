@@ -2303,12 +2303,24 @@ window.submitCreation = async function(type) {
     }
   };
 
+  // Track whether R2 upload succeeded so we can clean up on Firestore failure
+  let uploadedMediaKey = null;
+
   try {
     let r2Result = null; // { mediaKey, mediaUrl, mimeType, fileSize }
+
+    // ── [PUBLISH 1] Firebase user authenticated ──────────────────
+    if (!auth?.currentUser) {
+      Toast.error('Not signed in. Please log in and try again.');
+      if (publishBtn) publishBtn.disabled = false;
+      return;
+    }
+    console.log('[PUBLISH 1] Firebase user authenticated — uid:', auth.currentUser.uid);
 
     // ── Upload to R2 if there is a file ─────────────────────────
     if (!isTextOnly && selectedFile) {
       setProgress('Preparing…', 5);
+      console.log('[PUBLISH 2] Requesting Firebase ID token…');
       try {
         r2Result = await uploadMedia({
           file:      selectedFile,
@@ -2316,13 +2328,19 @@ window.submitCreation = async function(type) {
           auth,
           onProgress: ({ stage, percent }) => setProgress(stage, percent),
         });
+        uploadedMediaKey = r2Result?.mediaKey || null;
+        console.log('[PUBLISH 5] R2 upload completed — mediaKey:', uploadedMediaKey);
+        console.log('[PUBLISH 6] Media reference created — mediaUrl:', r2Result?.mediaUrl);
       } catch (uploadErr) {
-        console.error('[R2] Upload failed:', uploadErr);
-        Toast.error('Upload failed — ' + uploadErr.message + '. Try Again');
+        console.error('[PUBLISH] Upload failed at stage:', uploadErr.message, uploadErr);
+        const safeMsg = uploadErr.message || 'Unknown upload error';
+        Toast.error('Upload failed — ' + safeMsg);
         setProgress('Upload failed', 0);
         if (publishBtn) publishBtn.disabled = false;
         return; // Do NOT publish a broken creation
       }
+    } else {
+      console.log('[PUBLISH 2-6] Text-only post — skipping R2 upload');
     }
 
     setProgress('Processing…', 98);
@@ -2347,16 +2365,43 @@ window.submitCreation = async function(type) {
       coverURL: (!r2Result && mediaType === 'art')   ? localUrl : null,
     };
 
-    // ── Write to Firestore ───────────────────────────────────────
-    const newId = await fsAddCreation(creationData);
+    // ── [PUBLISH 7] Firestore write ──────────────────────────────
+    console.log('[PUBLISH 7] Firestore write started — type:', creationData.type,
+      '| mediaKey:', creationData.mediaKey, '| mediaUrl:', creationData.mediaUrl);
+    let newId;
+    try {
+      newId = await fsAddCreation(creationData);
+    } catch (fsErr) {
+      // R2 upload already succeeded — report the exact Firestore error
+      // and do NOT retry the upload.
+      const code = fsErr.code || '';
+      const msg  = fsErr.message || String(fsErr);
+      console.error('[PUBLISH] Firestore write failed — code:', code, '| message:', msg, fsErr);
+      const label = code === 'permission-denied'
+        ? 'Firestore: permission denied — check security rules'
+        : code ? `Firestore error (${code})`
+        : 'Firestore write failed';
+      Toast.error('Failed to publish\n\nStage: Firestore write\nError: ' + label + '\n' + msg.slice(0, 120));
+      setProgress('Publish failed', 0);
+      if (publishBtn) publishBtn.disabled = false;
+      return;
+    }
+    console.log('[PUBLISH 8] Firestore write completed — id:', newId);
+
     setProgress('Published', 100);
+    console.log('[PUBLISH 9] Creation published — id:', newId);
     document.getElementById('upload-form-wrap')?.classList.add('hidden');
     Toast.success('Published to Shadow of Salem!');
+    console.log('[PUBLISH 10] UI refreshed');
     if (newId) setTimeout(() => navigate('viewer', { id: newId }), 400);
 
   } catch (e) {
-    Toast.error('Failed to publish. Please try again.');
-    console.error(e);
+    // Catch-all for unexpected errors not already handled above
+    const code = e?.code || '';
+    const msg  = e?.message || String(e);
+    console.error('[PUBLISH] Unexpected error — code:', code, '| message:', msg, e);
+    const detail = code ? `${code}: ${msg}` : msg;
+    Toast.error('Failed to publish\n\nError: ' + detail.slice(0, 200));
     setProgress('', 0);
   } finally {
     if (publishBtn) publishBtn.disabled = false;

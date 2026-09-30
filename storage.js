@@ -205,6 +205,7 @@ export async function uploadMedia({ file, mediaKind, onProgress, auth }) {
 
   // 1. Get fresh ID token
   const idToken = await user.getIdToken(/* forceRefresh= */ false);
+  console.log('[PUBLISH 2] Firebase ID token obtained');
 
   progress('Preparing…', 5);
 
@@ -216,10 +217,12 @@ export async function uploadMedia({ file, mediaKind, onProgress, auth }) {
     console.error('[R2] requestUploadAuth failed:', e.message);
     throw new Error('Could not get upload authorization: ' + e.message);
   }
+  console.log('[PUBLISH 3] Worker authorization successful — mediaKey:', authResult.mediaKey);
 
   const { uploadToken, mediaKey } = authResult;
 
   progress('Uploading…', 10);
+  console.log('[PUBLISH 4] R2 upload started — size:', file.size, 'bytes');
 
   // 3. Upload to R2 through Worker
   try {
@@ -235,6 +238,7 @@ export async function uploadMedia({ file, mediaKind, onProgress, auth }) {
   progress('Processing…', 95);
 
   const mediaUrl = getMediaUrl(mediaKey);
+  console.log('[PUBLISH 5] R2 upload complete — mediaUrl:', mediaUrl);
 
   progress('Done', 100);
 
