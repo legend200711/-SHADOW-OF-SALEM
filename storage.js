@@ -6,42 +6,41 @@
    Everything else calls these functions.
 
    Architecture:
-     Browser → requestUploadAuth() → R2 Worker (/upload-auth)
-             ← presigned PUT URL + mediaKey
-     Browser → PUT <file> directly to R2 via presigned URL
+     Browser → POST /upload-auth { uid, fileName, mimeType, fileSize, mediaKind }
+                                 Authorization: Bearer <firebase-id-token>
+             ← { uploadToken, mediaKey, expires }
+
+     Browser → PUT /upload/<mediaKey>
+                                 X-Upload-Token: <uploadToken>
+                                 Content-Type: <mimeType>
+                                 body: raw file bytes
+             ← { ok: true, mediaKey }
+
      Browser → saves mediaKey + permanent public URL to Firestore
 
-   The R2 Secret Access Key NEVER reaches the browser.
-   The Worker verifies the Firebase ID token before issuing URLs.
+   The R2 secret key NEVER reaches the browser.
+   The Worker verifies the Firebase ID token before issuing upload tokens.
 
    Public media delivery:
-     Configure your R2 bucket with a public custom domain or use
-     the r2.dev subdomain.  Set the MEDIA_PUBLIC_BASE_URL constant
-     below to that base URL (no trailing slash).
+     Configure your R2 bucket with a public custom domain or use the
+     r2.dev subdomain.  Set MEDIA_PUBLIC_BASE below to that base URL
+     (no trailing slash).
      e.g.  https://media.shadowofsalem.com
      or    https://pub-<hash>.r2.dev
 
    Worker URL:
-     After deploying r2-worker/ set WORKER_URL below to its URL.
-     e.g.  https://shadow-of-salem-r2.<account>.workers.dev
+     Deployed at: https://shadow-of-salem-r2.nthntjrn.workers.dev
 ═══════════════════════════════════════════════════════════════ */
 
 // ─── Configuration ────────────────────────────────────────────
-// Replace these two values after you have deployed the Worker and
-// configured public access on your R2 bucket.
-//
-// WORKER_URL        — the deployed Worker URL (no trailing slash)
-//   Find it: Cloudflare Dashboard → Workers & Pages → shadow-of-salem-r2 → the URL shown
-//   Format:  https://shadow-of-salem-r2.<YOUR-ACCOUNT>.workers.dev
-//
-// MEDIA_PUBLIC_BASE — the public base URL for R2 objects (no trailing slash)
-//   Find it: Cloudflare Dashboard → R2 → shadow-of-salem-media → Settings → Public Access
-//   Format:  https://pub-<hash>.r2.dev  OR  https://media.yourdomain.com
-//
-// These are NOT secrets — they are just endpoint URLs.
-// The actual R2 secret key lives only in the Worker.
 
-export const WORKER_URL        = 'REPLACE_WITH_WORKER_URL';   // e.g. https://shadow-of-salem-r2.abc123.workers.dev
+// WORKER_URL — the deployed Worker (no trailing slash)
+export const WORKER_URL = 'https://shadow-of-salem-r2.nthntjrn.workers.dev';
+
+// MEDIA_PUBLIC_BASE — public base URL for R2 objects (no trailing slash)
+// Set this to your R2 bucket's public URL once you enable public access.
+// Find it: Cloudflare Dashboard → R2 → shadow-of-salem-media → Settings → Public Access
+// Format:  https://pub-<hash>.r2.dev  OR  https://media.yourdomain.com
 export const MEDIA_PUBLIC_BASE = 'REPLACE_WITH_R2_PUBLIC_URL'; // e.g. https://pub-abc123.r2.dev
 
 // ─── Types / constants ────────────────────────────────────────
@@ -63,28 +62,15 @@ export const MEDIA_KINDS = {
 // ─── Core functions ───────────────────────────────────────────
 
 /**
- * Request a presigned upload URL from the Worker.
- *
- * @param {string}   idToken   — Firebase ID token (from getIdToken())
- * @param {string}   uid       — Firebase UID
- * @param {File}     file      — the File object to upload
- * @param {string}   mediaKind — one of MEDIA_KINDS
- * @returns {Promise<{ uploadUrl: string, mediaKey: string }>}
+ * Step 1: Request an upload token from the Worker.
+ * The Worker verifies the Firebase ID token and returns a short-lived
+ * upload token that authorises the subsequent PUT.
  */
 async function requestUploadAuth(idToken, uid, file, mediaKind) {
-  // ── Guard: catch un-replaced placeholder URLs before making a useless request ──
-  if (WORKER_URL.startsWith('REPLACE_') || WORKER_URL.includes('REPLACE_WITH')) {
-    throw new Error(
-      'WORKER_URL has not been set in storage.js. ' +
-      'Open Cloudflare Dashboard → Workers & Pages → shadow-of-salem-r2 ' +
-      'and copy the Worker URL into WORKER_URL in storage.js.'
-    );
-  }
-
   const endpoint = `${WORKER_URL}/upload-auth`;
 
   console.log('[R2] Requesting upload authorization');
-  console.log('[R2] Authorization endpoint:', endpoint);
+  console.log('[R2] Endpoint:', endpoint);
   console.log('[R2] mediaKind:', mediaKind, '| fileName:', file.name, '| fileSize:', file.size, '| mimeType:', file.type);
 
   let resp;
@@ -107,7 +93,7 @@ async function requestUploadAuth(idToken, uid, file, mediaKind) {
     console.error('[R2] Network error contacting Worker:', networkErr);
     throw new Error(
       `Network error reaching Worker at ${endpoint}. ` +
-      'Check WORKER_URL in storage.js and that the Worker is deployed.'
+      'Check that the Worker is deployed and WORKER_URL is correct.'
     );
   }
 
@@ -116,13 +102,13 @@ async function requestUploadAuth(idToken, uid, file, mediaKind) {
   if (!resp.ok) {
     let errBody;
     try { errBody = await resp.json(); } catch { errBody = { error: resp.statusText }; }
-    console.error('[R2] Authorization response:', errBody);
+    console.error('[R2] Authorization failed — HTTP', resp.status, '—', errBody);
 
     const httpLabel = {
       400: '400 Bad Request',
       401: '401 Authentication required',
       403: '403 Upload not authorized',
-      404: '404 Worker endpoint not found — check WORKER_URL',
+      404: '404 Worker endpoint not found',
       405: '405 Method not allowed',
       413: '413 File too large',
       500: '500 Worker error',
@@ -134,23 +120,22 @@ async function requestUploadAuth(idToken, uid, file, mediaKind) {
 
   const result = await resp.json();
   console.log('[R2] Authorization succeeded — mediaKey:', result.mediaKey);
-  return result; // { uploadUrl, mediaKey, expires }
+  return result; // { uploadToken, mediaKey, expires }
 }
 
 /**
- * Upload a file directly to R2 using the presigned PUT URL.
+ * Step 2: Upload a file directly to R2 through the Worker.
+ * Sends the raw file as the request body with the upload token for auth.
  * Calls onProgress(percent) periodically during upload.
- *
- * @param {string}   uploadUrl   — presigned PUT URL from the Worker
- * @param {File}     file        — the File to upload
- * @param {Function} onProgress  — called with 0–100
- * @returns {Promise<void>}
  */
-async function putToR2(uploadUrl, file, onProgress) {
+function putToWorker(uploadToken, mediaKey, file, onProgress) {
   return new Promise((resolve, reject) => {
+    const url = `${WORKER_URL}/upload/${mediaKey.split('/').map(encodeURIComponent).join('/')}`;
+
     const xhr = new XMLHttpRequest();
-    xhr.open('PUT', uploadUrl);
+    xhr.open('PUT', url);
     xhr.setRequestHeader('Content-Type', file.type);
+    xhr.setRequestHeader('X-Upload-Token', uploadToken);
 
     if (onProgress) {
       xhr.upload.addEventListener('progress', e => {
@@ -164,7 +149,13 @@ async function putToR2(uploadUrl, file, onProgress) {
       if (xhr.status >= 200 && xhr.status < 300) {
         resolve();
       } else {
-        reject(new Error(`R2 PUT failed: HTTP ${xhr.status}`));
+        let errMsg = `R2 upload failed: HTTP ${xhr.status}`;
+        try {
+          const body = JSON.parse(xhr.responseText);
+          if (body.error) errMsg += ' — ' + body.error;
+        } catch { /* ignore */ }
+        console.error('[R2] PUT failed:', errMsg, '| response:', xhr.responseText);
+        reject(new Error(errMsg));
       }
     });
 
@@ -193,15 +184,15 @@ export function getMediaUrl(mediaKey) {
  * Upload a media file to R2.
  *
  * Handles the full flow:
- *   1. Request presigned URL from Worker (verifies Firebase auth)
- *   2. PUT file directly to R2
+ *   1. Request upload token from Worker (verifies Firebase auth)
+ *   2. PUT file through Worker directly to R2
  *   3. Return { mediaKey, mediaUrl } for saving to Firestore
  *
  * @param {Object}   opts
- * @param {File}     opts.file       — the File to upload
- * @param {string}   opts.mediaKind  — 'music' | 'audio' | 'video' | 'art' | 'profile' | 'cover'
- * @param {Function} [opts.onProgress]  — called with { stage: string, percent: number }
- * @param {Object}   opts.auth       — { currentUser } from Firebase Auth
+ * @param {File}     opts.file        — the File to upload
+ * @param {string}   opts.mediaKind   — 'music' | 'audio' | 'video' | 'art' | 'profile' | 'cover'
+ * @param {Function} [opts.onProgress] — called with { stage: string, percent: number }
+ * @param {Object}   opts.auth        — { currentUser } from Firebase Auth
  * @returns {Promise<{ mediaKey: string, mediaUrl: string, mimeType: string, fileSize: number }>}
  */
 export async function uploadMedia({ file, mediaKind, onProgress, auth }) {
@@ -219,23 +210,29 @@ export async function uploadMedia({ file, mediaKind, onProgress, auth }) {
 
   progress('Preparing…', 5);
 
-  // 2. Request presigned PUT URL from Worker
+  // 2. Request upload token from Worker
   let authResult;
   try {
     authResult = await requestUploadAuth(idToken, user.uid, file, mediaKind);
   } catch (e) {
+    console.error('[R2] requestUploadAuth failed:', e.message);
     throw new Error('Could not get upload authorization: ' + e.message);
   }
 
-  const { uploadUrl, mediaKey } = authResult;
+  const { uploadToken, mediaKey } = authResult;
 
   progress('Uploading…', 10);
 
-  // 3. Upload to R2 directly
-  await putToR2(uploadUrl, file, pct => {
-    // Scale to 10–90 range so we have room for pre/post steps
-    progress('Uploading…', 10 + Math.round(pct * 0.8));
-  });
+  // 3. Upload to R2 through Worker
+  try {
+    await putToWorker(uploadToken, mediaKey, file, pct => {
+      // Scale to 10–90 range so we have room for pre/post steps
+      progress('Uploading…', 10 + Math.round(pct * 0.8));
+    });
+  } catch (e) {
+    console.error('[R2] putToWorker failed:', e.message);
+    throw new Error('Upload to R2 failed: ' + e.message);
+  }
 
   progress('Processing…', 95);
 

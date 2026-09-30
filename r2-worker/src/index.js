@@ -3,17 +3,28 @@
    src/index.js
 
    Endpoints:
-     POST /upload-auth    — verify Firebase JWT, return presigned PUT URL + key
-     DELETE /media/:key*  — verify Firebase JWT, verify ownership, delete object
-     OPTIONS /*           — CORS preflight
+     GET  /health             — liveness check (no auth required)
+     POST /upload-auth        — verify Firebase JWT, return authorized upload ticket
+     PUT  /upload/:key*       — upload file body directly to R2 (ticket auth)
+     DELETE /media/:key*      — verify Firebase JWT, verify ownership, delete object
+     OPTIONS /*               — CORS preflight
 
-   Environment bindings expected (set via wrangler secret or R2 binding):
-     MEDIA_BUCKET         R2 bucket binding
-     ALLOWED_ORIGIN       production origin string, e.g. https://shadowofsalem.com
+   Architecture (no S3 HMAC keys required):
+     Browser → POST /upload-auth  { uid, fileName, mimeType, fileSize, mediaKind }
+                                  Authorization: Bearer <firebase-id-token>
+             ← { uploadToken, mediaKey, expires }
+
+     Browser → PUT /upload/<mediaKey>
+                                  X-Upload-Token: <uploadToken>
+                                  Content-Type: <mimeType>
+                                  body: raw file bytes
+             ← { ok: true, mediaKey }
+
+   Environment bindings expected:
+     MEDIA_BUCKET         R2 bucket binding  (set in wrangler.jsonc)
+     ALLOWED_ORIGIN       production origin, e.g. https://legend200711.github.io
      FIREBASE_PROJECT_ID  Firebase project ID (for JWT verification)
-     R2_ACCOUNT_ID        Cloudflare account ID  (for S3-compat presign)
-     R2_ACCESS_KEY_ID     R2 S3-compat access key ID
-     R2_SECRET_ACCESS_KEY R2 S3-compat secret access key (NEVER sent to browser)
+     UPLOAD_SECRET        a random secret used to sign upload tokens (wrangler secret)
 ═══════════════════════════════════════════════════════════════ */
 
 'use strict';
@@ -22,16 +33,12 @@
 
 function corsHeaders(origin, env) {
   const allowed = env.ALLOWED_ORIGIN || '';
-  // ALLOWED_ORIGIN is a comma-separated list of allowed origins.
-  // Set it via: npx wrangler secret put ALLOWED_ORIGIN
-  // Value for GitHub Pages: https://<your-username>.github.io
-  // If empty, all origins are allowed (useful during initial setup).
   const allowedList = allowed.split(',').map(s => s.trim()).filter(Boolean);
   const ok = allowedList.length === 0 || allowedList.includes(origin);
   return {
-    'Access-Control-Allow-Origin':  ok ? origin : allowedList[0] || '*',
-    'Access-Control-Allow-Methods': 'POST, DELETE, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+    'Access-Control-Allow-Origin':  ok ? origin : (allowedList[0] || '*'),
+    'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Upload-Token',
     'Access-Control-Max-Age':       '86400',
     'Vary':                         'Origin',
   };
@@ -45,21 +52,12 @@ function json(data, status = 200, origin = '*', env = {}) {
 }
 
 // ─── Firebase JWT verification ────────────────────────────────
-// We verify the Firebase ID token signature using Google's public JWKs.
-// This is a lightweight implementation that checks:
-//   - iss (issuer)   — must be accounts.google.com or securetoken.google.com
-//   - aud (audience) — must be the Firebase project ID
-//   - exp (expiry)   — must not be in the past
-//   - sub (subject)  — non-empty string (= Firebase UID)
-//
-// We verify the signature against the current Firebase public certs
-// (fetched from a well-known Google URL; cached per request).
+// Verifies the Firebase ID token signature using Google's public JWKs.
 
 const FIREBASE_CERTS_URL =
   'https://www.googleapis.com/robot/v1/metadata/x509/securetoken@system.gserviceaccount.com';
 
 async function verifyFirebaseToken(token, projectId) {
-  // 1. Decode header + payload (no signature check yet)
   const parts = token.split('.');
   if (parts.length !== 3) throw new Error('Malformed JWT');
 
@@ -71,7 +69,6 @@ async function verifyFirebaseToken(token, projectId) {
   const header  = JSON.parse(b64url(parts[0]));
   const payload = JSON.parse(b64url(parts[1]));
 
-  // 2. Basic claim validation
   const now = Math.floor(Date.now() / 1000);
   if (payload.exp <= now)             throw new Error('Token expired');
   if (payload.aud !== projectId)      throw new Error('Token audience mismatch');
@@ -82,7 +79,6 @@ async function verifyFirebaseToken(token, projectId) {
   if (!validIssuers.includes(payload.iss)) throw new Error('Token issuer invalid');
   if (!payload.sub || typeof payload.sub !== 'string') throw new Error('No subject');
 
-  // 3. Fetch Google public certs and verify signature
   const certsResp = await fetch(FIREBASE_CERTS_URL, { cf: { cacheTtl: 3600 } });
   if (!certsResp.ok) throw new Error('Could not fetch Firebase certs');
   const certs = await certsResp.json();
@@ -90,7 +86,6 @@ async function verifyFirebaseToken(token, projectId) {
   const certPem = certs[header.kid];
   if (!certPem) throw new Error(`No cert for kid ${header.kid}`);
 
-  // Convert PEM → CryptoKey
   const pemBody   = certPem.replace(/-----[^-]+-----/g, '').replace(/\s/g, '');
   const derBuffer = Uint8Array.from(atob(pemBody), c => c.charCodeAt(0));
   const cryptoKey = await crypto.subtle.importKey(
@@ -99,7 +94,6 @@ async function verifyFirebaseToken(token, projectId) {
     false, ['verify']
   );
 
-  // Re-encode header.payload bytes for signature verification
   const encoder  = new TextEncoder();
   const sigInput = encoder.encode(parts[0] + '.' + parts[1]);
   const sigBytes = Uint8Array.from(b64url(parts[2]), c => c.charCodeAt(0));
@@ -112,90 +106,30 @@ async function verifyFirebaseToken(token, projectId) {
   return payload; // { sub: uid, email, ... }
 }
 
-// ─── AWS Signature v4 presigned URL (S3-compatible) ──────────
-// Cloudflare R2 supports S3-compatible presigned PUT URLs.
-// We compute a presigned PUT URL that the browser can use
-// to upload directly to R2 — the secret key never leaves the Worker.
+// ─── Upload token (HMAC-SHA-256) ──────────────────────────────
+// Signs { key, mimeType, expires } so the PUT endpoint can verify
+// the token without calling Firebase again.
 
-async function presignPut(env, key, mimeType, expiresSeconds = 300) {
-  const region    = 'auto';
-  const service   = 's3';
-  const accountId = env.R2_ACCOUNT_ID;
-  const accessKey = env.R2_ACCESS_KEY_ID;
-  const secretKey = env.R2_SECRET_ACCESS_KEY;
-  const bucket    = env.MEDIA_BUCKET_NAME || 'shadow-of-salem-media';
-
-  // Guard: all three R2 credentials must be present
-  if (!accountId) throw new Error('Missing secret: R2_ACCOUNT_ID');
-  if (!accessKey) throw new Error('Missing secret: R2_ACCESS_KEY_ID');
-  if (!secretKey) throw new Error('Missing secret: R2_SECRET_ACCESS_KEY');
-
-  const host      = `${accountId}.r2.cloudflarestorage.com`;
-  const endpoint  = `https://${host}/${bucket}/${key}`;
-
-  const now       = new Date();
-  const dateStamp = now.toISOString().slice(0, 10).replace(/-/g, '');     // 20240101
-  const amzDate   = now.toISOString().replace(/[-:]/g, '').slice(0, 15) + 'Z'; // 20240101T120000Z
-
-  const credential = `${accessKey}/${dateStamp}/${region}/${service}/aws4_request`;
-
-  const params = new URLSearchParams({
-    'X-Amz-Algorithm':     'AWS4-HMAC-SHA256',
-    'X-Amz-Credential':    credential,
-    'X-Amz-Date':          amzDate,
-    'X-Amz-Expires':       String(expiresSeconds),
-    'X-Amz-SignedHeaders': 'content-type;host',
-  });
-  params.sort();
-
-  const canonicalRequest = [
-    'PUT',
-    `/${bucket}/${key}`,
-    params.toString(),
-    `content-type:${mimeType}\nhost:${host}\n`,
-    'content-type;host',
-    'UNSIGNED-PAYLOAD',
-  ].join('\n');
-
-  const credentialScope = `${dateStamp}/${region}/${service}/aws4_request`;
-  const stringToSign    = [
-    'AWS4-HMAC-SHA256',
-    amzDate,
-    credentialScope,
-    await sha256hex(canonicalRequest),
-  ].join('\n');
-
-  // Derive signing key
-  const enc   = new TextEncoder();
-  const hmac  = async (key, data) => {
-    const k = typeof key === 'string' ? enc.encode(key) : key;
-    const ck = await crypto.subtle.importKey('raw', k, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
-    return new Uint8Array(await crypto.subtle.sign('HMAC', ck, enc.encode(data)));
-  };
-
-  const signingKey = await hmac(
-    await hmac(
-      await hmac(
-        await hmac('AWS4' + secretKey, dateStamp),
-        region
-      ),
-      service
-    ),
-    'aws4_request'
+async function signUploadToken(secret, key, mimeType, expiresMs) {
+  const enc  = new TextEncoder();
+  const data = `${key}|${mimeType}|${expiresMs}`;
+  const ck   = await crypto.subtle.importKey(
+    'raw', enc.encode(secret),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false, ['sign']
   );
-
-  const signatureBytes = await hmac(signingKey, stringToSign);
-  const signature = Array.from(signatureBytes).map(b => b.toString(16).padStart(2, '0')).join('');
-
-  params.set('X-Amz-Signature', signature);
-
-  return `${endpoint}?${params.toString()}`;
+  const sig = await crypto.subtle.sign('HMAC', ck, enc.encode(data));
+  const hex = Array.from(new Uint8Array(sig)).map(b => b.toString(16).padStart(2, '0')).join('');
+  return `${expiresMs}.${hex}`;
 }
 
-async function sha256hex(str) {
-  const buf    = new TextEncoder().encode(str);
-  const digest = await crypto.subtle.digest('SHA-256', buf);
-  return Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, '0')).join('');
+async function verifyUploadToken(secret, token, key, mimeType) {
+  const [expiresStr, hex] = token.split('.');
+  if (!expiresStr || !hex) throw new Error('Malformed upload token');
+  const expiresMs = parseInt(expiresStr, 10);
+  if (isNaN(expiresMs) || Date.now() > expiresMs) throw new Error('Upload token expired');
+  const expected = await signUploadToken(secret, key, mimeType, expiresMs);
+  if (expected !== token) throw new Error('Upload token signature invalid');
 }
 
 // ─── Key generation ───────────────────────────────────────────
@@ -226,9 +160,9 @@ const ALLOWED_MIME = new Set([
 ]);
 
 const MAX_SIZES = {
-  image:   20 * 1024 * 1024,   // 20 MB
-  audio:   200 * 1024 * 1024,  // 200 MB
-  video:   2 * 1024 * 1024 * 1024, // 2 GB (presigned upload; actual limit enforced by R2)
+  image: 20  * 1024 * 1024,
+  audio: 200 * 1024 * 1024,
+  video: 2   * 1024 * 1024 * 1024,
 };
 
 function mimeCategory(mime) {
@@ -242,9 +176,9 @@ function mimeCategory(mime) {
 
 export default {
   async fetch(request, env) {
-    const origin  = request.headers.get('Origin') || '';
-    const url     = new URL(request.url);
-    const method  = request.method.toUpperCase();
+    const origin = request.headers.get('Origin') || '';
+    const url    = new URL(request.url);
+    const method = request.method.toUpperCase();
 
     // CORS preflight
     if (method === 'OPTIONS') {
@@ -256,24 +190,41 @@ export default {
 
     const path = url.pathname;
 
+    // ── GET /health ───────────────────────────────────────────
+    if (method === 'GET' && path === '/health') {
+      const bucketOk = !!env.MEDIA_BUCKET;
+      const firebaseOk = !!env.FIREBASE_PROJECT_ID;
+      const secretOk   = !!env.UPLOAD_SECRET;
+      return json({
+        ok: bucketOk && firebaseOk && secretOk,
+        bucket:   bucketOk   ? 'bound'   : 'MISSING',
+        firebase: firebaseOk ? 'set'     : 'MISSING — set FIREBASE_PROJECT_ID secret',
+        secret:   secretOk   ? 'set'     : 'MISSING — set UPLOAD_SECRET secret',
+      }, 200, origin, env);
+    }
+
     // ── POST /upload-auth ─────────────────────────────────────
     // Body: { uid, fileName, mimeType, fileSize, mediaKind }
-    // Returns: { uploadUrl, mediaKey, expires }
+    // Returns: { uploadToken, mediaKey, expires }
     if (method === 'POST' && path === '/upload-auth') {
-      // 1. Read + verify the Firebase ID token
+      console.log('[UPLOAD] Request received');
+
+      // 1. Verify Firebase ID token
       const authHeader = request.headers.get('Authorization') || '';
       const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
-      if (!token) return json({ error: 'Missing Authorization' }, 401, origin, env);
+      if (!token) return json({ error: 'Missing Authorization header' }, 401, origin, env);
 
       const projectId = env.FIREBASE_PROJECT_ID;
-      if (!projectId) return json({ error: 'Worker not configured — missing FIREBASE_PROJECT_ID' }, 500, origin, env);
+      if (!projectId) return json({ error: 'Worker misconfigured — missing FIREBASE_PROJECT_ID' }, 500, origin, env);
 
       let claims;
       try {
         claims = await verifyFirebaseToken(token, projectId);
       } catch (e) {
+        console.error('[UPLOAD] Firebase token verification failed:', e.message);
         return json({ error: 'Unauthorized: ' + e.message }, 401, origin, env);
       }
+      console.log('[UPLOAD] Authentication verified — uid:', claims.sub);
 
       const tokenUid = claims.sub;
 
@@ -283,39 +234,80 @@ export default {
 
       const { uid, fileName, mimeType, fileSize, mediaKind } = body;
 
-      // UID in body must match the verified token UID
       if (!uid || uid !== tokenUid) {
         return json({ error: 'UID mismatch' }, 403, origin, env);
       }
-
       if (!ALLOWED_MIME.has(mimeType)) {
         return json({ error: `Unsupported media type: ${mimeType}` }, 400, origin, env);
       }
-
-      const cat    = mimeCategory(mimeType);
-      const maxSz  = MAX_SIZES[cat] || MAX_SIZES.image;
+      const cat   = mimeCategory(mimeType);
+      const maxSz = MAX_SIZES[cat] || MAX_SIZES.image;
       if (fileSize > maxSz) {
         return json({ error: `File too large (max ${maxSz / 1024 / 1024} MB for ${cat})` }, 413, origin, env);
       }
+      console.log('[UPLOAD] File validated — kind:', mediaKind, 'mime:', mimeType, 'size:', fileSize);
 
-      const folder = FOLDER_MAP[mediaKind] || 'creations/other';
-      const key    = generateKey(uid, folder, fileName || 'upload');
+      // 3. Check R2 binding
+      if (!env.MEDIA_BUCKET) {
+        console.error('[UPLOAD] R2 binding MEDIA_BUCKET is missing');
+        return json({ error: 'R2 bucket not bound — check Worker bindings' }, 500, origin, env);
+      }
+      console.log('[UPLOAD] R2 binding available');
 
-      // 3. Generate presigned PUT URL (valid 5 minutes)
-      let uploadUrl;
-      try {
-        uploadUrl = await presignPut(env, key, mimeType, 300);
-      } catch (e) {
-        console.error('presignPut error:', e);
-        return json({ error: 'Could not generate upload URL. Check R2 Worker secrets.' }, 500, origin, env);
+      // 4. Check upload signing secret
+      const uploadSecret = env.UPLOAD_SECRET;
+      if (!uploadSecret) {
+        console.error('[UPLOAD] UPLOAD_SECRET not set');
+        return json({ error: 'Worker misconfigured — missing UPLOAD_SECRET' }, 500, origin, env);
       }
 
-      return json({ uploadUrl, mediaKey: key, expires: Date.now() + 300_000 }, 200, origin, env);
+      // 5. Generate upload token (valid 10 minutes)
+      const folder  = FOLDER_MAP[mediaKind] || 'creations/other';
+      const key     = generateKey(uid, folder, fileName || 'upload');
+      const expires = Date.now() + 10 * 60 * 1000;
+      const uploadToken = await signUploadToken(uploadSecret, key, mimeType, expires);
+
+      console.log('[UPLOAD] Authorization generated — key:', key);
+      return json({ uploadToken, mediaKey: key, expires }, 200, origin, env);
+    }
+
+    // ── PUT /upload/:key* ─────────────────────────────────────
+    // Headers: X-Upload-Token: <token>  Content-Type: <mimeType>
+    // Body: raw file bytes
+    if (method === 'PUT' && path.startsWith('/upload/')) {
+      const mediaKey = decodeURIComponent(path.slice('/upload/'.length));
+      if (!mediaKey) return json({ error: 'Missing media key' }, 400, origin, env);
+
+      const uploadToken = request.headers.get('X-Upload-Token') || '';
+      const mimeType    = request.headers.get('Content-Type') || 'application/octet-stream';
+
+      const uploadSecret = env.UPLOAD_SECRET;
+      if (!uploadSecret) return json({ error: 'Worker misconfigured — missing UPLOAD_SECRET' }, 500, origin, env);
+
+      try {
+        await verifyUploadToken(uploadSecret, uploadToken, mediaKey, mimeType);
+      } catch (e) {
+        return json({ error: 'Upload not authorized: ' + e.message }, 403, origin, env);
+      }
+
+      if (!env.MEDIA_BUCKET) {
+        return json({ error: 'R2 bucket not bound' }, 500, origin, env);
+      }
+
+      try {
+        await env.MEDIA_BUCKET.put(mediaKey, request.body, {
+          httpMetadata: { contentType: mimeType },
+        });
+      } catch (e) {
+        console.error('[UPLOAD] R2 put error:', e);
+        return json({ error: 'Upload to R2 failed: ' + e.message }, 500, origin, env);
+      }
+
+      console.log('[UPLOAD] Response returned — mediaKey:', mediaKey);
+      return json({ ok: true, mediaKey }, 200, origin, env);
     }
 
     // ── DELETE /media/:key* ───────────────────────────────────
-    // URL:  /media/users/{uid}/...
-    // Auth: Authorization: Bearer <Firebase ID token>
     if (method === 'DELETE' && path.startsWith('/media/')) {
       const authHeader = request.headers.get('Authorization') || '';
       const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
@@ -331,10 +323,7 @@ export default {
         return json({ error: 'Unauthorized: ' + e.message }, 401, origin, env);
       }
 
-      // Key is everything after /media/
       const mediaKey = decodeURIComponent(path.slice('/media/'.length));
-
-      // Verify the key belongs to this user: key must start with users/{uid}/
       const expectedPrefix = `users/${claims.sub}/`;
       if (!mediaKey.startsWith(expectedPrefix)) {
         return json({ error: 'Forbidden: you can only delete your own media' }, 403, origin, env);
